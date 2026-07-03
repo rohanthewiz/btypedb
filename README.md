@@ -70,6 +70,47 @@ their writes invisibly until Commit. Readers never block and never take
 locks while iterating. Multi-op commits are framed as an atomic batch in
 the log, so crash recovery applies a transaction all-or-nothing.
 
+### TTL
+
+```go
+err = db.SetTTL("session:42", sess, 30*time.Minute) // expires in 30m
+d, ok := db.TTL("session:42")                       // remaining time
+```
+
+Expired keys become invisible to reads immediately and are physically
+removed by a background sweeper (default every 500ms; tune or disable
+with `WithSweepInterval`). Deadlines are stored absolutely in the log,
+so they survive restarts; keys that expire while the database is closed
+are gone on reopen. A plain `Set` clears any TTL.
+
+### Secondary indexes
+
+An index is an extra sort order over the same pairs, defined by a
+comparator and maintained atomically with every commit:
+
+```go
+err = db.CreateIndex("by-age", func(ak string, av User, bk string, bv User) int {
+    return cmp.Compare(av.Age, bv.Age)
+})
+for k, u := range db.AscendIndex("by-age") { /* youngest first */ }
+for k, u := range db.DescendIndex("by-age") { /* oldest first */ }
+for k, u := range db.AscendIndexFrom("by-age", "", User{Age: 40}) { /* 40+ */ }
+```
+
+Transactions see indexes transactionally: a write tx queries its own
+uncommitted updates via `tx.AscendIndex`, and rollback discards index
+changes with everything else. Comparators can't be persisted, so
+re-register indexes after each `Open` (the build scans existing data).
+
+### Range deletes
+
+```go
+n, err := db.DeleteRange("user:", "user;") // [min, max), returns count
+```
+
+Runs as one atomic transaction — a single batched log append that
+replays all-or-nothing. Also available as `tx.DeleteRange`.
+
 ### Sync policies
 
 ```go
@@ -106,8 +147,10 @@ Single append-only file of framed records:
 op(1) | klen(4) | vlen(4) | key | val | crc32(4)
 ```
 
-Ops are `set(1)`, `delete(2)`, and `batch(3)` — a batch header (val =
-uint64 count) marks the next N records as one atomic transaction.
+Ops are `set(1)`, `delete(2)`, `batch(3)` — a batch header (val =
+uint64 count) marks the next N records as one atomic transaction — and
+`setttl(4)`, whose value bytes are prefixed with the absolute expiry
+deadline (8 bytes, unix nanos).
 
 On open the log is replayed into the B-tree. A torn or CRC-failing record
 (crash mid-append) marks the end of valid data; the tail is truncated and
@@ -119,4 +162,4 @@ all-or-nothing: a tear anywhere inside it discards the whole group.
 - [x] **Phase 1**: Open/Close, Get/Set/Delete, WAL append + replay, torn-tail recovery, sync policies, ordered iteration
 - [x] **Phase 2**: transactions via btype's O(1) COW snapshots (`Begin/Commit/Rollback`, `View`/`Update`), lock-free read snapshots, atomic batch commits, batched fsync
 - [x] **Phase 3**: background + manual compaction (snapshot rewrite with atomic swap), SIGKILL crash-test suite
-- [ ] **Phase 4**: secondary indexes, range-delete, TTL via `btype.Prique`
+- [x] **Phase 4**: secondary indexes, atomic range-delete, TTL with background sweeper (deadline-ordered `btype.Table`)

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 func openStr(t *testing.T, path string, opts ...Option) *DB[string, string] {
@@ -356,12 +357,18 @@ func TestTxIteration(t *testing.T) {
 // the COW concurrency model: many read transactions iterate frozen
 // snapshots while writable transactions and direct writes churn the tree.
 func TestConcurrentSnapshotsUnderWrites(t *testing.T) {
-	db, err := Open(filepath.Join(t.TempDir(), "test.db"), Int64Codec, Int64Codec, WithSyncPolicy(SyncNever))
+	db, err := Open(filepath.Join(t.TempDir(), "test.db"), Int64Codec, Int64Codec,
+		WithSyncPolicy(SyncNever), WithSweepInterval(5*time.Millisecond))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
 
+	if err := db.CreateIndex("by-val-desc", func(ak, av, bk, bv int64) int {
+		return int(bv - av) // descending by value
+	}); err != nil {
+		t.Fatal(err)
+	}
 	for i := range int64(500) {
 		if err := db.Set(i, i); err != nil {
 			t.Fatal(err)
@@ -381,6 +388,10 @@ func TestConcurrentSnapshotsUnderWrites(t *testing.T) {
 						if err := tx.Set(base+round*50+i, i); err != nil {
 							return err
 						}
+					}
+					// Race the TTL trees and sweeper too.
+					if err := tx.SetTTL(base+round, round, time.Millisecond); err != nil {
+						return err
 					}
 					_, err := tx.Delete(base + round*50)
 					return err
@@ -410,8 +421,19 @@ func TestConcurrentSnapshotsUnderWrites(t *testing.T) {
 					for range tx.All() {
 						n++
 					}
-					if n != tx.Len() {
-						return errors.New("snapshot iteration count != snapshot Len")
+					// n may trail Len by expired-unswept keys, never exceed it.
+					if n > tx.Len() {
+						return errors.New("snapshot iterated more pairs than snapshot Len")
+					}
+					// Iterated later, the index can only have seen more keys
+					// expire — never extra entries (which would mean the
+					// index holds duplicates or leaked pairs).
+					idx := 0
+					for range tx.AscendIndex("by-val-desc") {
+						idx++
+					}
+					if idx > n {
+						return errors.New("index iterated more pairs than primary tree")
 					}
 					return nil
 				})

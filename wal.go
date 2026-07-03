@@ -13,7 +13,7 @@ import (
 
 // The write-ahead log is a single append-only file of framed records:
 //
-//	op    1 byte   (1 = set, 2 = delete, 3 = batch header)
+//	op    1 byte   (1 = set, 2 = delete, 3 = batch header, 4 = set with TTL)
 //	klen  4 bytes  little-endian
 //	vlen  4 bytes  little-endian (0 for delete)
 //	key   klen bytes
@@ -24,6 +24,10 @@ import (
 // N records as one atomic transaction: replay applies them all or, if
 // any part is torn or corrupt, discards the whole group.
 //
+// A set-with-TTL record prefixes its value bytes with the absolute
+// expiry deadline (8 bytes, unix nanoseconds, little-endian), so replay
+// at any later time reconstructs the same expiration.
+//
 // A record that is truncated or fails its CRC marks the end of the valid
 // log; everything from that offset on is discarded on open (torn-write
 // recovery after a crash mid-append).
@@ -32,13 +36,24 @@ const (
 	opSet    byte = 1
 	opDelete byte = 2
 	opBatch  byte = 3
+	opSetTTL byte = 4
 )
 
 const (
 	recHeaderSize = 9 // op(1) + klen(4) + vlen(4)
 	recCRCSize    = 4
+	ttlPrefixSize = 8       // deadline prefix on opSetTTL values
 	maxPartLen    = 1 << 30 // sanity bound on klen/vlen; larger reads as corruption
 )
+
+// prependDeadline returns val prefixed with the encoded expiry deadline,
+// forming the value payload of an opSetTTL record.
+func prependDeadline(deadline int64, val []byte) []byte {
+	out := make([]byte, ttlPrefixSize+len(val))
+	binary.LittleEndian.PutUint64(out, uint64(deadline))
+	copy(out[ttlPrefixSize:], val)
+	return out
+}
 
 // appendRecord appends one framed record to dst and returns the extended slice.
 func appendRecord(dst []byte, op byte, key, val []byte) []byte {
@@ -74,7 +89,7 @@ func readRecord(br *bufio.Reader) (rec walRecord, size int64, ok bool, err error
 	op := hdr[0]
 	klen := int64(binary.LittleEndian.Uint32(hdr[1:5]))
 	vlen := int64(binary.LittleEndian.Uint32(hdr[5:9]))
-	if (op != opSet && op != opDelete && op != opBatch) || klen > maxPartLen || vlen > maxPartLen {
+	if op < opSet || op > opSetTTL || klen > maxPartLen || vlen > maxPartLen {
 		return rec, 0, false, nil // corrupt
 	}
 

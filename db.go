@@ -12,10 +12,16 @@
 // writable transaction stages changes privately, committing them with a
 // single batched log append and an atomic root swap. Multi-op commits
 // are framed in the log so crash recovery applies them all-or-nothing.
+//
+// Keys may carry a TTL (SetTTL); expired keys become invisible to reads
+// immediately and are physically removed by a background sweeper.
+// Secondary indexes (CreateIndex) provide additional sort orders over
+// the same data, maintained atomically with every commit.
 package btypedb
 
 import (
 	"cmp"
+	"encoding/binary"
 	"errors"
 	"io"
 	"iter"
@@ -24,7 +30,6 @@ import (
 	"time"
 
 	"github.com/rohanthewiz/serr"
-	"github.com/tidwall/btype"
 )
 
 // ErrClosed is returned by operations on a closed database.
@@ -52,6 +57,7 @@ type options struct {
 	autoCompact      bool
 	compactMinSize   int64
 	compactGrowthPct int
+	sweepInterval    time.Duration
 }
 
 func defaultOptions() options {
@@ -59,6 +65,7 @@ func defaultOptions() options {
 		autoCompact:      true,
 		compactMinSize:   32 << 20, // 32 MB
 		compactGrowthPct: 100,
+		sweepInterval:    500 * time.Millisecond,
 	}
 }
 
@@ -85,6 +92,14 @@ func WithAutoCompactDisabled() Option {
 	return func(o *options) { o.autoCompact = false }
 }
 
+// WithSweepInterval sets how often the background sweeper physically
+// removes expired keys (default 500ms). Zero or negative disables the
+// sweeper; expired keys then stay invisible but occupy memory and log
+// space until overwritten, deleted, or dropped by compaction.
+func WithSweepInterval(d time.Duration) Option {
+	return func(o *options) { o.sweepInterval = d }
+}
+
 // DB is an embedded key-value store. Keys are kept in sorted order.
 // All methods are safe for concurrent use.
 type DB[K cmp.Ordered, V any] struct {
@@ -95,6 +110,7 @@ type DB[K cmp.Ordered, V any] struct {
 	autoCompact      bool
 	compactMinSize   int64
 	compactGrowthPct int
+	sweepInterval    time.Duration
 
 	// writerMu serializes writable transactions and direct writes with
 	// each other. Lock order: writerMu before mu, always.
@@ -105,7 +121,7 @@ type DB[K cmp.Ordered, V any] struct {
 	compactMu sync.Mutex
 
 	mu         sync.RWMutex
-	m          *btype.Map[K, V]
+	state      *dbState[K, V]
 	file       *os.File
 	wbuf       []byte // reusable record-encoding buffer, guarded by mu
 	walSize    int64  // bytes of valid log on disk
@@ -115,10 +131,13 @@ type DB[K cmp.Ordered, V any] struct {
 	writeErr   error // sticky: after a failed log append the DB refuses writes
 	syncErr    error // last error from the background syncer, surfaced on Close
 	compactErr error // last error from auto-compaction, surfaced on Close
+	sweepErr   error // last error from the expiry sweeper, surfaced on Close
 
-	bgWG     sync.WaitGroup // in-flight auto-compactions
-	stopSync chan struct{}
-	syncDone chan struct{}
+	bgWG      sync.WaitGroup // in-flight auto-compactions
+	stopSync  chan struct{}
+	syncDone  chan struct{}
+	stopSweep chan struct{}
+	sweepDone chan struct{}
 }
 
 // Open opens (creating if necessary) the database file at path and
@@ -140,7 +159,7 @@ func Open[K cmp.Ordered, V any](path string, keyCodec Codec[K], valCodec Codec[V
 		return nil, serr.Wrap(err, "path", path)
 	}
 
-	m := btype.NewMap[K, V]()
+	state := newDBState[K, V]()
 	validLen, err := replayLog(f, func(rec walRecord) error {
 		key, err := keyCodec.Decode(rec.key)
 		if err != nil {
@@ -152,9 +171,19 @@ func Open[K cmp.Ordered, V any](path string, keyCodec Codec[K], valCodec Codec[V
 			if err != nil {
 				return serr.Wrap(err, "decoding", "value")
 			}
-			m.Set(key, val)
+			state.set(key, val, 0)
+		case opSetTTL:
+			if len(rec.val) < ttlPrefixSize {
+				return serr.New("malformed ttl record")
+			}
+			deadline := int64(binary.LittleEndian.Uint64(rec.val))
+			val, err := valCodec.Decode(rec.val[ttlPrefixSize:])
+			if err != nil {
+				return serr.Wrap(err, "decoding", "value")
+			}
+			state.set(key, val, deadline)
 		case opDelete:
-			m.Delete(key)
+			state.delete(key)
 		}
 		return nil
 	})
@@ -183,7 +212,8 @@ func Open[K cmp.Ordered, V any](path string, keyCodec Codec[K], valCodec Codec[V
 		autoCompact:      o.autoCompact,
 		compactMinSize:   o.compactMinSize,
 		compactGrowthPct: o.compactGrowthPct,
-		m:                m,
+		sweepInterval:    o.sweepInterval,
+		state:            state,
 		file:             f,
 		walSize:          validLen,
 		baseSize:         validLen,
@@ -193,14 +223,33 @@ func Open[K cmp.Ordered, V any](path string, keyCodec Codec[K], valCodec Codec[V
 		db.syncDone = make(chan struct{})
 		go db.backgroundSync()
 	}
+	if db.sweepInterval > 0 {
+		db.stopSweep = make(chan struct{})
+		db.sweepDone = make(chan struct{})
+		go db.sweepLoop()
+	}
 	return db, nil
 }
 
-// Set stores value under key, replacing any existing value.
-// The write is appended to the log before it is visible in memory.
-// Set blocks while a writable transaction is open; do not call it from
-// inside an Update function — use the Tx methods there.
+// Set stores value under key, replacing any existing value and clearing
+// any TTL. The write is appended to the log before it is visible in
+// memory. Set blocks while a writable transaction is open; do not call
+// it from inside an Update function — use the Tx methods there.
 func (db *DB[K, V]) Set(key K, value V) error {
+	return db.setInternal(key, value, 0)
+}
+
+// SetTTL stores value under key with a time-to-live: once ttl elapses
+// the key becomes invisible to reads and is later removed by the
+// background sweeper. Setting a key again replaces any previous TTL.
+func (db *DB[K, V]) SetTTL(key K, value V, ttl time.Duration) error {
+	if ttl <= 0 {
+		return serr.New("ttl must be positive")
+	}
+	return db.setInternal(key, value, time.Now().Add(ttl).UnixNano())
+}
+
+func (db *DB[K, V]) setInternal(key K, value V, deadline int64) error {
 	kb, err := db.keyCodec.Encode(key)
 	if err != nil {
 		return serr.Wrap(err, "encoding", "key")
@@ -209,6 +258,10 @@ func (db *DB[K, V]) Set(key K, value V) error {
 	if err != nil {
 		return serr.Wrap(err, "encoding", "value")
 	}
+	op := opSet
+	if deadline > 0 {
+		op, vb = opSetTTL, prependDeadline(deadline, vb)
+	}
 
 	db.writerMu.Lock()
 	defer db.writerMu.Unlock()
@@ -217,20 +270,35 @@ func (db *DB[K, V]) Set(key K, value V) error {
 	if err := db.canWrite(); err != nil {
 		return err
 	}
-	if err := db.appendToLog(opSet, kb, vb); err != nil {
+	if err := db.appendToLog(op, kb, vb); err != nil {
 		return err
 	}
-	db.m.Set(key, value)
+	db.state.set(key, value, deadline)
 	return nil
 }
 
-// Delete removes key, reporting whether it existed. Deleting an absent
-// key is a no-op and writes nothing to the log.
+// TTL returns the remaining time-to-live for key. ok is false when the
+// key is absent, already expired, or has no deadline.
+func (db *DB[K, V]) TTL(key K) (remaining time.Duration, ok bool) {
+	now := time.Now().UnixNano()
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	dl, ok := db.state.ttl.Get(key)
+	if !ok || dl <= now {
+		return 0, false
+	}
+	return time.Duration(dl - now), true
+}
+
+// Delete removes key, reporting whether it was visible (present and not
+// expired). An expired-but-unswept key is physically removed but
+// reported as absent. Deleting a missing key writes nothing to the log.
 func (db *DB[K, V]) Delete(key K) (existed bool, err error) {
 	kb, err := db.keyCodec.Encode(key)
 	if err != nil {
 		return false, serr.Wrap(err, "encoding", "key")
 	}
+	now := time.Now().UnixNano()
 
 	db.writerMu.Lock()
 	defer db.writerMu.Unlock()
@@ -239,45 +307,67 @@ func (db *DB[K, V]) Delete(key K) (existed bool, err error) {
 	if err := db.canWrite(); err != nil {
 		return false, err
 	}
-	if !db.m.Contains(key) {
+	if !db.state.data.Contains(key) {
 		return false, nil
 	}
+	visible := !db.state.expired(key, now)
 	if err := db.appendToLog(opDelete, kb, nil); err != nil {
 		return false, err
 	}
-	db.m.Delete(key)
-	return true, nil
+	db.state.delete(key)
+	return visible, nil
 }
 
-// Get returns the value stored under key.
+// DeleteRange atomically removes every key in [min, max), returning how
+// many visible keys were deleted. It runs as one transaction: a single
+// batched log append that replays all-or-nothing.
+func (db *DB[K, V]) DeleteRange(min, max K) (int, error) {
+	var n int
+	err := db.Update(func(tx *Tx[K, V]) error {
+		var err error
+		n, err = tx.DeleteRange(min, max)
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// Get returns the value stored under key. Expired keys read as absent.
 func (db *DB[K, V]) Get(key K) (value V, ok bool) {
+	now := time.Now().UnixNano()
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	return db.m.Get(key)
+	return db.state.get(key, now)
 }
 
-// Contains reports whether key exists.
+// Contains reports whether key exists and has not expired.
 func (db *DB[K, V]) Contains(key K) bool {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-	return db.m.Contains(key)
+	_, ok := db.Get(key)
+	return ok
 }
 
-// Len returns the number of stored keys.
+// Len returns the number of stored keys. Expired keys are counted until
+// the sweeper removes them.
 func (db *DB[K, V]) Len() int {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	return db.m.Len()
+	return db.state.data.Len()
 }
 
-// All iterates every key-value pair in ascending key order. The read
-// lock is held for the duration of the loop, so do not call Set, Delete,
-// or Close from inside it.
+// All iterates every unexpired key-value pair in ascending key order.
+// The read lock is held for the duration of the loop, so do not call
+// Set, Delete, or Close from inside it.
 func (db *DB[K, V]) All() iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
+		now := time.Now().UnixNano()
 		db.mu.RLock()
 		defer db.mu.RUnlock()
-		for k, v := range db.m.All() {
+		for k, v := range db.state.data.All() {
+			if db.state.expired(k, now) {
+				continue
+			}
 			if !yield(k, v) {
 				return
 			}
@@ -289,9 +379,13 @@ func (db *DB[K, V]) All() iter.Seq2[K, V] {
 // The same locking caveat as All applies.
 func (db *DB[K, V]) Ascend(from K) iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
+		now := time.Now().UnixNano()
 		db.mu.RLock()
 		defer db.mu.RUnlock()
-		for k, v := range db.m.Ascend(from) {
+		for k, v := range db.state.data.Ascend(from) {
+			if db.state.expired(k, now) {
+				continue
+			}
 			if !yield(k, v) {
 				return
 			}
@@ -326,6 +420,10 @@ func (db *DB[K, V]) Close() error {
 		close(db.stopSync)
 		<-db.syncDone
 	}
+	if db.stopSweep != nil {
+		close(db.stopSweep)
+		<-db.sweepDone
+	}
 	db.bgWG.Wait() // let any in-flight auto-compaction finish or abort
 
 	// Take mu for the final file ops: a manual Compact racing Close may
@@ -333,11 +431,10 @@ func (db *DB[K, V]) Close() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	var errs []error
-	if db.syncErr != nil {
-		errs = append(errs, db.syncErr)
-	}
-	if db.compactErr != nil {
-		errs = append(errs, db.compactErr)
+	for _, bgErr := range []error{db.syncErr, db.compactErr, db.sweepErr} {
+		if bgErr != nil {
+			errs = append(errs, bgErr)
+		}
 	}
 	if err := db.file.Sync(); err != nil {
 		errs = append(errs, serr.Wrap(err, "op", "final sync"))
@@ -359,12 +456,11 @@ func (db *DB[K, V]) canWrite() error {
 	return nil
 }
 
-// releaseSnap returns a transaction snapshot's nodes to the COW
-// refcounting scheme. Copy and Release mutate shared bookkeeping, so
-// both happen under mu.
-func (db *DB[K, V]) releaseSnap(snap *btype.Map[K, V]) {
+// releaseState returns a snapshot's trees to the COW refcounting scheme.
+// Copy and Release mutate shared bookkeeping, so both happen under mu.
+func (db *DB[K, V]) releaseState(st *dbState[K, V]) {
 	db.mu.Lock()
-	snap.Release()
+	st.release()
 	db.mu.Unlock()
 }
 

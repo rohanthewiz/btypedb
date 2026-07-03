@@ -6,9 +6,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/rohanthewiz/serr"
-	"github.com/tidwall/btype"
 )
 
 // compactSuffix names the temp file a compaction streams into. A
@@ -36,14 +36,14 @@ func (db *DB[K, V]) Compact() error {
 		db.mu.Unlock()
 		return serr.Wrap(db.writeErr, "state", "log is suspect after a failed append; not compacting")
 	}
-	snap := db.m.Copy()
+	snap := db.state.copy()
 	tailStart := db.walSize
 	db.mu.Unlock()
 
 	tmpPath := db.path + compactSuffix
 	tmp, err := os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
-		db.releaseSnap(snap)
+		db.releaseState(snap)
 		return serr.Wrap(err, "path", tmpPath)
 	}
 	discard := func() {
@@ -54,7 +54,7 @@ func (db *DB[K, V]) Compact() error {
 	// Stream the snapshot with no locks held: it is immutable, and
 	// writers keep appending to the live log meanwhile.
 	snapBytes, err := db.writeSnapshot(tmp, snap)
-	db.releaseSnap(snap)
+	db.releaseState(snap)
 	if err != nil {
 		discard()
 		return err
@@ -95,13 +95,18 @@ func (db *DB[K, V]) Compact() error {
 	return nil
 }
 
-// writeSnapshot streams every pair in snap to f as set records and
-// returns the byte count written.
-func (db *DB[K, V]) writeSnapshot(f *os.File, snap *btype.Map[K, V]) (int64, error) {
+// writeSnapshot streams every live pair in snap to f as set records —
+// with the deadline preserved for TTL'd keys, and already-expired keys
+// dropped entirely — and returns the byte count written.
+func (db *DB[K, V]) writeSnapshot(f *os.File, snap *dbState[K, V]) (int64, error) {
+	now := time.Now().UnixNano()
 	w := bufio.NewWriterSize(f, 1<<20)
 	var n int64
 	var rec []byte
-	for k, v := range snap.All() {
+	for k, v := range snap.data.All() {
+		if snap.expired(k, now) {
+			continue
+		}
 		kb, err := db.keyCodec.Encode(k)
 		if err != nil {
 			return 0, serr.Wrap(err, "encoding", "key")
@@ -110,7 +115,11 @@ func (db *DB[K, V]) writeSnapshot(f *os.File, snap *btype.Map[K, V]) (int64, err
 		if err != nil {
 			return 0, serr.Wrap(err, "encoding", "value")
 		}
-		rec = appendRecord(rec[:0], opSet, kb, vb)
+		op := opSet
+		if dl, hasTTL := snap.ttl.Get(k); hasTTL {
+			op, vb = opSetTTL, prependDeadline(dl, vb)
+		}
+		rec = appendRecord(rec[:0], op, kb, vb)
 		if _, err := w.Write(rec); err != nil {
 			return 0, serr.Wrap(err, "op", "write snapshot record")
 		}

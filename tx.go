@@ -5,9 +5,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"iter"
+	"time"
 
 	"github.com/rohanthewiz/serr"
-	"github.com/tidwall/btype"
 )
 
 // ErrTxClosed is returned by operations on a committed or rolled-back transaction.
@@ -16,7 +16,8 @@ var ErrTxClosed = errors.New("btypedb: transaction has already been committed or
 // ErrTxNotWritable is returned when writing through a read-only transaction.
 var ErrTxNotWritable = errors.New("btypedb: transaction is read-only")
 
-// Tx is a transaction over an O(1) copy-on-write snapshot of the database.
+// Tx is a transaction over an O(1) copy-on-write snapshot of the entire
+// database state — data, TTLs, and secondary indexes together.
 //
 // A read-only transaction sees the database exactly as it was at Begin,
 // no matter what commits afterward, and reads without taking any locks.
@@ -30,7 +31,7 @@ var ErrTxNotWritable = errors.New("btypedb: transaction is read-only")
 // goroutines (the DB itself is).
 type Tx[K cmp.Ordered, V any] struct {
 	db       *DB[K, V]
-	m        *btype.Map[K, V] // private COW snapshot
+	state    *dbState[K, V] // private COW snapshot of all trees
 	writable bool
 	pending  []byte // framed WAL records accumulated by this tx
 	nops     uint64
@@ -57,9 +58,9 @@ func (db *DB[K, V]) Begin(writable bool) (*Tx[K, V], error) {
 		}
 		return nil, err
 	}
-	snap := db.m.Copy()
+	snap := db.state.copy()
 	db.mu.Unlock()
-	return &Tx[K, V]{db: db, m: snap, writable: writable}, nil
+	return &Tx[K, V]{db: db, state: snap, writable: writable}, nil
 }
 
 // View runs fn inside a read-only transaction, releasing the snapshot
@@ -90,7 +91,7 @@ func (db *DB[K, V]) Update(fn func(tx *Tx[K, V]) error) error {
 // Commit publishes the transaction's changes: the accumulated records are
 // appended to the log in one write (multi-op transactions are framed as an
 // atomic batch), fsynced per policy, and the snapshot becomes the live
-// tree in a single pointer swap. Committing a read-only or empty
+// state in a single pointer swap. Committing a read-only or empty
 // transaction just releases the snapshot.
 func (tx *Tx[K, V]) Commit() error {
 	if tx.done {
@@ -100,7 +101,7 @@ func (tx *Tx[K, V]) Commit() error {
 	db := tx.db
 
 	if !tx.writable {
-		db.releaseSnap(tx.m)
+		db.releaseState(tx.state)
 		return nil
 	}
 	defer db.writerMu.Unlock()
@@ -108,11 +109,11 @@ func (tx *Tx[K, V]) Commit() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if err := db.canWrite(); err != nil {
-		tx.m.Release()
+		tx.state.release()
 		return err
 	}
 	if tx.nops == 0 {
-		tx.m.Release()
+		tx.state.release()
 		return nil
 	}
 
@@ -128,20 +129,20 @@ func (tx *Tx[K, V]) Commit() error {
 	}
 	if _, err := db.file.Write(buf); err != nil {
 		db.writeErr = err
-		tx.m.Release()
+		tx.state.release()
 		return serr.Wrap(err, "op", "tx log append")
 	}
 	if db.policy == SyncAlways {
 		if err := db.file.Sync(); err != nil {
 			db.writeErr = err
-			tx.m.Release()
+			tx.state.release()
 			return serr.Wrap(err, "op", "tx log sync")
 		}
 	}
 
-	old := db.m
-	db.m = tx.m
-	old.Release()
+	old := db.state
+	db.state = tx.state
+	old.release()
 	db.walSize += int64(len(buf))
 	db.maybeAutoCompact()
 	return nil
@@ -154,16 +155,30 @@ func (tx *Tx[K, V]) Rollback() error {
 		return nil
 	}
 	tx.done = true
-	tx.db.releaseSnap(tx.m)
+	tx.db.releaseState(tx.state)
 	if tx.writable {
 		tx.db.writerMu.Unlock()
 	}
 	return nil
 }
 
-// Set stores value under key within the transaction. The change is
-// visible to this transaction immediately and to others after Commit.
+// Set stores value under key within the transaction, clearing any TTL.
+// The change is visible to this transaction immediately and to others
+// after Commit.
 func (tx *Tx[K, V]) Set(key K, value V) error {
+	return tx.setInternal(key, value, 0)
+}
+
+// SetTTL stores value under key with a time-to-live within the
+// transaction.
+func (tx *Tx[K, V]) SetTTL(key K, value V, ttl time.Duration) error {
+	if ttl <= 0 {
+		return serr.New("ttl must be positive")
+	}
+	return tx.setInternal(key, value, time.Now().Add(ttl).UnixNano())
+}
+
+func (tx *Tx[K, V]) setInternal(key K, value V, deadline int64) error {
 	if tx.done {
 		return ErrTxClosed
 	}
@@ -178,14 +193,18 @@ func (tx *Tx[K, V]) Set(key K, value V) error {
 	if err != nil {
 		return serr.Wrap(err, "encoding", "value")
 	}
-	tx.pending = appendRecord(tx.pending, opSet, kb, vb)
+	op := opSet
+	if deadline > 0 {
+		op, vb = opSetTTL, prependDeadline(deadline, vb)
+	}
+	tx.pending = appendRecord(tx.pending, op, kb, vb)
 	tx.nops++
-	tx.m.Set(key, value)
+	tx.state.set(key, value, deadline)
 	return nil
 }
 
-// Delete removes key within the transaction, reporting whether it
-// existed in the transaction's view.
+// Delete removes key within the transaction, reporting whether it was
+// visible (present and not expired) in the transaction's view.
 func (tx *Tx[K, V]) Delete(key K) (existed bool, err error) {
 	if tx.done {
 		return false, ErrTxClosed
@@ -193,52 +212,112 @@ func (tx *Tx[K, V]) Delete(key K) (existed bool, err error) {
 	if !tx.writable {
 		return false, ErrTxNotWritable
 	}
-	if !tx.m.Contains(key) {
+	if !tx.state.data.Contains(key) {
 		return false, nil
 	}
 	kb, err := tx.db.keyCodec.Encode(key)
 	if err != nil {
 		return false, serr.Wrap(err, "encoding", "key")
 	}
+	visible := !tx.state.expired(key, time.Now().UnixNano())
 	tx.pending = appendRecord(tx.pending, opDelete, kb, nil)
 	tx.nops++
-	tx.m.Delete(key)
-	return true, nil
+	tx.state.delete(key)
+	return visible, nil
+}
+
+// DeleteRange removes every key in [min, max) within the transaction,
+// returning how many visible keys were deleted. Keys are encoded before
+// anything is mutated, so a codec failure leaves the transaction intact.
+func (tx *Tx[K, V]) DeleteRange(min, max K) (int, error) {
+	if tx.done {
+		return 0, ErrTxClosed
+	}
+	if !tx.writable {
+		return 0, ErrTxNotWritable
+	}
+
+	var keys []K
+	for k := range tx.state.data.Ascend(min) {
+		if k >= max {
+			break
+		}
+		keys = append(keys, k)
+	}
+	encoded := make([][]byte, len(keys))
+	for i, k := range keys {
+		kb, err := tx.db.keyCodec.Encode(k)
+		if err != nil {
+			return 0, serr.Wrap(err, "encoding", "key")
+		}
+		encoded[i] = kb
+	}
+
+	now := time.Now().UnixNano()
+	visible := 0
+	for i, k := range keys {
+		if !tx.state.expired(k, now) {
+			visible++
+		}
+		tx.pending = appendRecord(tx.pending, opDelete, encoded[i], nil)
+		tx.nops++
+		tx.state.delete(k)
+	}
+	return visible, nil
 }
 
 // Get returns the value stored under key in the transaction's view,
-// including this transaction's own uncommitted writes.
+// including this transaction's own uncommitted writes. Expired keys
+// read as absent.
 func (tx *Tx[K, V]) Get(key K) (value V, ok bool) {
 	if tx.done {
 		return value, false
 	}
-	return tx.m.Get(key)
+	return tx.state.get(key, time.Now().UnixNano())
 }
 
-// Contains reports whether key exists in the transaction's view.
+// Contains reports whether key exists unexpired in the transaction's view.
 func (tx *Tx[K, V]) Contains(key K) bool {
-	if tx.done {
-		return false
-	}
-	return tx.m.Contains(key)
+	_, ok := tx.Get(key)
+	return ok
 }
 
-// Len returns the number of keys in the transaction's view.
+// TTL returns the remaining time-to-live for key in the transaction's
+// view. ok is false when the key is absent, expired, or has no deadline.
+func (tx *Tx[K, V]) TTL(key K) (remaining time.Duration, ok bool) {
+	if tx.done {
+		return 0, false
+	}
+	now := time.Now().UnixNano()
+	dl, ok := tx.state.ttl.Get(key)
+	if !ok || dl <= now {
+		return 0, false
+	}
+	return time.Duration(dl - now), true
+}
+
+// Len returns the number of keys in the transaction's view, counting
+// expired keys not yet swept.
 func (tx *Tx[K, V]) Len() int {
 	if tx.done {
 		return 0
 	}
-	return tx.m.Len()
+	return tx.state.data.Len()
 }
 
-// All iterates the transaction's view in ascending key order. Unlike
-// DB.All, no lock is held: the snapshot is immutable.
+// All iterates the transaction's view in ascending key order, skipping
+// expired keys. Unlike DB.All, no lock is held: the snapshot is
+// immutable.
 func (tx *Tx[K, V]) All() iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
 		if tx.done {
 			return
 		}
-		for k, v := range tx.m.All() {
+		now := time.Now().UnixNano()
+		for k, v := range tx.state.data.All() {
+			if tx.state.expired(k, now) {
+				continue
+			}
 			if !yield(k, v) {
 				return
 			}
@@ -247,13 +326,17 @@ func (tx *Tx[K, V]) All() iter.Seq2[K, V] {
 }
 
 // Ascend iterates the transaction's view in ascending order starting at
-// the first key >= from.
+// the first key >= from, skipping expired keys.
 func (tx *Tx[K, V]) Ascend(from K) iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
 		if tx.done {
 			return
 		}
-		for k, v := range tx.m.Ascend(from) {
+		now := time.Now().UnixNano()
+		for k, v := range tx.state.data.Ascend(from) {
+			if tx.state.expired(k, now) {
+				continue
+			}
 			if !yield(k, v) {
 				return
 			}
