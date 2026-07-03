@@ -49,6 +49,20 @@ const (
 	SyncNever
 )
 
+// logfile is what the DB needs from its write-ahead log file. *os.File
+// satisfies it directly; tests inject fault-simulating implementations
+// to model power loss (unsynced writes vanishing, records tearing).
+type logfile interface {
+	io.Reader
+	io.Writer
+	io.ReaderAt
+	io.Closer
+	Seek(offset int64, whence int) (int64, error)
+	Sync() error
+	Truncate(size int64) error
+	Stat() (os.FileInfo, error)
+}
+
 // Option configures a DB at open time.
 type Option func(*options)
 
@@ -58,6 +72,7 @@ type options struct {
 	compactMinSize   int64
 	compactGrowthPct int
 	sweepInterval    time.Duration
+	openFile         func(path string) (logfile, error) // test seam; nil = real file
 }
 
 func defaultOptions() options {
@@ -122,7 +137,7 @@ type DB[K cmp.Ordered, V any] struct {
 
 	mu         sync.RWMutex
 	state      *dbState[K, V]
-	file       *os.File
+	file       logfile
 	wbuf       []byte // reusable record-encoding buffer, guarded by mu
 	walSize    int64  // bytes of valid log on disk
 	baseSize   int64  // log size just after the last compaction (or open)
@@ -154,7 +169,13 @@ func Open[K cmp.Ordered, V any](path string, keyCodec Codec[K], valCodec Codec[V
 	// rename; it was never live, so discard it.
 	os.Remove(path + compactSuffix)
 
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
+	openFile := o.openFile
+	if openFile == nil {
+		openFile = func(p string) (logfile, error) {
+			return os.OpenFile(p, os.O_RDWR|os.O_CREATE, 0o644)
+		}
+	}
+	f, err := openFile(path)
 	if err != nil {
 		return nil, serr.Wrap(err, "path", path)
 	}
@@ -369,6 +390,42 @@ func (db *DB[K, V]) All() iter.Seq2[K, V] {
 				continue
 			}
 			if !yield(k, v) {
+				return
+			}
+		}
+	}
+}
+
+// Keys iterates every unexpired key in ascending order. The same
+// locking caveat as All applies.
+func (db *DB[K, V]) Keys() iter.Seq[K] {
+	return func(yield func(K) bool) {
+		now := time.Now().UnixNano()
+		db.mu.RLock()
+		defer db.mu.RUnlock()
+		for k := range db.state.data.All() {
+			if db.state.expired(k, now) {
+				continue
+			}
+			if !yield(k) {
+				return
+			}
+		}
+	}
+}
+
+// Values iterates every unexpired value in ascending key order. The
+// same locking caveat as All applies.
+func (db *DB[K, V]) Values() iter.Seq[V] {
+	return func(yield func(V) bool) {
+		now := time.Now().UnixNano()
+		db.mu.RLock()
+		defer db.mu.RUnlock()
+		for k, v := range db.state.data.All() {
+			if db.state.expired(k, now) {
+				continue
+			}
+			if !yield(v) {
 				return
 			}
 		}

@@ -325,6 +325,43 @@ func (tx *Tx[K, V]) All() iter.Seq2[K, V] {
 	}
 }
 
+// Keys iterates the transaction's unexpired keys in ascending order.
+func (tx *Tx[K, V]) Keys() iter.Seq[K] {
+	return func(yield func(K) bool) {
+		if tx.done {
+			return
+		}
+		now := time.Now().UnixNano()
+		for k := range tx.state.data.All() {
+			if tx.state.expired(k, now) {
+				continue
+			}
+			if !yield(k) {
+				return
+			}
+		}
+	}
+}
+
+// Values iterates the transaction's unexpired values in ascending key
+// order.
+func (tx *Tx[K, V]) Values() iter.Seq[V] {
+	return func(yield func(V) bool) {
+		if tx.done {
+			return
+		}
+		now := time.Now().UnixNano()
+		for k, v := range tx.state.data.All() {
+			if tx.state.expired(k, now) {
+				continue
+			}
+			if !yield(v) {
+				return
+			}
+		}
+	}
+}
+
 // Ascend iterates the transaction's view in ascending order starting at
 // the first key >= from, skipping expired keys.
 func (tx *Tx[K, V]) Ascend(from K) iter.Seq2[K, V] {

@@ -31,6 +31,8 @@ for k, u := range db.Ascend("m") { // every key >= "m", ascending
     _ = k
     _ = u
 }
+for k := range db.Keys() { _ = k }   // ascending keys
+for u := range db.Values() { _ = u } // values in key order
 ```
 
 Codecs only define the on-disk encoding; in-memory ordering is the key
@@ -163,3 +165,32 @@ all-or-nothing: a tear anywhere inside it discards the whole group.
 - [x] **Phase 2**: transactions via btype's O(1) COW snapshots (`Begin/Commit/Rollback`, `View`/`Update`), lock-free read snapshots, atomic batch commits, batched fsync
 - [x] **Phase 3**: background + manual compaction (snapshot rewrite with atomic swap), SIGKILL crash-test suite
 - [x] **Phase 4**: secondary indexes, atomic range-delete, TTL with background sweeper (deadline-ordered `btype.Table`)
+- [x] **v0.1.0 prep**: btype version pin with guard test, power-loss fault-injection harness, `Keys()`/`Values()` iterators
+
+## Crash safety testing
+
+Two layers beyond ordinary unit tests:
+
+- **SIGKILL suite** (`crash_test.go`): the test binary re-execs itself as
+  a write-hammering child and kills it at varied points, verifying
+  recovery and transaction atomicity. Kills don't lose the OS page
+  cache, so this exercises replay and the compaction swap window — not
+  fsync ordering.
+- **Power-loss harness** (`powerfail_test.go`): a fault-injecting log
+  file models durable-vs-unsynced bytes with `Sync` as the promotion
+  point. The durability test asserts that with `SyncAlways` every
+  acknowledged op survives a cut at every ack boundary *exactly* (this
+  catches ack-before-fsync and apply-before-log ordering bugs), plus
+  torn mid-record cuts and garbage tails. The consistency test opens
+  every byte-length prefix of a real log and checks transactions are
+  applied all-or-nothing.
+
+## Dependency pin
+
+`tidwall/btype` is pre-v1 with an unstable API, and this package's
+lock-free snapshot reads rely on btype internals verified by source
+inspection (atomic COW refcounts; shared nodes are copied, never mutated
+in place) that aren't part of its documented contract. The version is
+deliberately pinned; `TestBtypePinned` fails on drift. To upgrade:
+re-inspect those properties, run the full suite (race hammer + crash +
+power-loss tests), then bump the pin in `go.mod` and `pin_test.go`.

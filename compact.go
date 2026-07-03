@@ -98,7 +98,7 @@ func (db *DB[K, V]) Compact() error {
 // writeSnapshot streams every live pair in snap to f as set records —
 // with the deadline preserved for TTL'd keys, and already-expired keys
 // dropped entirely — and returns the byte count written.
-func (db *DB[K, V]) writeSnapshot(f *os.File, snap *dbState[K, V]) (int64, error) {
+func (db *DB[K, V]) writeSnapshot(f io.Writer, snap *dbState[K, V]) (int64, error) {
 	now := time.Now().UnixNano()
 	w := bufio.NewWriterSize(f, 1<<20)
 	var n int64
