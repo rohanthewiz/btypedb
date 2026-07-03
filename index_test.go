@@ -72,6 +72,17 @@ func TestCreateIndexAndIterate(t *testing.T) {
 		t.Fatalf("AscendIndexFrom(40) = %v; want [grace edsger]", from)
 	}
 
+	// Descending pivot: everyone at most 40, oldest of those first.
+	downFrom := indexKeys(db.DescendIndexFrom("by-age", "", person{Age: 40}))
+	if !slices.Equal(downFrom, []string{"ada", "alan"}) {
+		t.Fatalf("DescendIndexFrom(40) = %v; want [ada alan]", downFrom)
+	}
+	// An exact-match pivot is included.
+	at := indexKeys(db.DescendIndexFrom("by-age", "grace", person{Age: 45}))
+	if !slices.Equal(at, []string{"grace", "ada", "alan"}) {
+		t.Fatalf("DescendIndexFrom(grace,45) = %v; want [grace ada alan]", at)
+	}
+
 	if names := db.Indexes(); !slices.Equal(names, []string{"by-age"}) {
 		t.Fatalf("Indexes() = %v", names)
 	}
@@ -138,6 +149,12 @@ func TestIndexTransactional(t *testing.T) {
 	}
 	if got := indexKeys(tx.AscendIndex("by-age")); !slices.Equal(got, []string{"y", "x"}) {
 		t.Fatalf("tx index = %v; want own write visible", got)
+	}
+	if got := indexKeys(tx.DescendIndexFrom("by-age", "", person{Age: 40})); !slices.Equal(got, []string{"y"}) {
+		t.Fatalf("tx DescendIndexFrom(40) = %v; want [y]", got)
+	}
+	if got := indexKeys(db.DescendIndexFrom("by-age", "", person{Age: 40})); got != nil {
+		t.Fatalf("db DescendIndexFrom(40) sees uncommitted write: %v", got)
 	}
 	if got := indexKeys(db.AscendIndex("by-age")); !slices.Equal(got, []string{"x"}) {
 		t.Fatalf("db index sees uncommitted write: %v", got)

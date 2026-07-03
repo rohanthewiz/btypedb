@@ -102,6 +102,7 @@ err = db.CreateIndex("by-age", func(ak string, av User, bk string, bv User) int 
 for k, u := range db.AscendIndex("by-age") { /* youngest first */ }
 for k, u := range db.DescendIndex("by-age") { /* oldest first */ }
 for k, u := range db.AscendIndexFrom("by-age", "", User{Age: 40}) { /* 40+ */ }
+for k, u := range db.DescendIndexFrom("by-age", "", User{Age: 40}) { /* ≤40, oldest of those first */ }
 ```
 
 Transactions see indexes transactionally: a write tx queries its own
@@ -182,6 +183,7 @@ all-or-nothing: a tear anywhere inside it discards the whole group.
 - [x] **Phase 4**: secondary indexes, atomic range-delete, TTL with background sweeper (deadline-ordered `btype.Table`)
 - [x] **v0.1.0 prep**: btype version pin with guard test, power-loss fault-injection harness, `Keys()`/`Values()` iterators
 - [x] **v0.2.0 prep**: `Descend`/`Backward` reverse iteration, expired-aware `LiveLen`, group commit (fsync coalescing across concurrent writers), power-loss fault injection for the compaction temp-file/rename path
+- [x] **v0.3.0 prep**: `DescendIndexFrom` descending index pivots; compaction power-loss harness hardened with torn temp-file content and writes racing the compaction into the spliced tail
 
 ## Crash safety testing
 
@@ -205,8 +207,12 @@ Two layers beyond ordinary unit tests:
   file contents are durable only after the file's fsync, and
   create/rename/remove only after the directory's. Power is cut at
   every operation boundary of a compaction under both a
-  metadata-conservative and a metadata-eager assumption; every cut must
-  recover the exact pre-compaction state, and writes acknowledged after
+  metadata-conservative and a metadata-eager assumption, plus torn
+  variants where the compaction temp file keeps only a torn prefix of
+  its unsynced content; every cut must recover exactly the state acked
+  at that point. Writes race the compaction itself, landing in the log
+  tail that gets spliced into the compacted file — so a tail that rides
+  unsynced through the rename is caught — and writes acknowledged after
   the compaction must survive even if no later metadata persisted
   (verifying the temp file is fsynced before the rename, and the
   directory after it).

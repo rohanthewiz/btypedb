@@ -121,6 +121,14 @@ func (p *powerFile) durableSnapshot() []byte {
 	return slices.Clone(p.durable)
 }
 
+// tornSnapshot returns the durable bytes plus a torn prefix of the
+// bytes still in flight — another state a power cut may leave behind.
+func (p *powerFile) tornSnapshot() []byte {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append(slices.Clone(p.durable), p.pending[:len(p.pending)/2]...)
+}
+
 type pfInfo struct{ size int64 }
 
 func (pfInfo) Name() string       { return "powerfile" }

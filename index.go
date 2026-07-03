@@ -88,6 +88,12 @@ func (db *DB[K, V]) AscendIndexFrom(name string, pivotKey K, pivotValue V) iter.
 	return db.iterIndex(name, false, true, pivotKey, pivotValue)
 }
 
+// DescendIndexFrom iterates the named index in reverse order, starting
+// at the last entry <= the pivot pair per the index's comparator.
+func (db *DB[K, V]) DescendIndexFrom(name string, pivotKey K, pivotValue V) iter.Seq2[K, V] {
+	return db.iterIndex(name, true, true, pivotKey, pivotValue)
+}
+
 func (db *DB[K, V]) iterIndex(name string, desc, pivoted bool, pk K, pv V) iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
 		db.mu.RLock()
@@ -118,6 +124,12 @@ func (tx *Tx[K, V]) AscendIndexFrom(name string, pivotKey K, pivotValue V) iter.
 	return tx.iterIndex(name, false, true, pivotKey, pivotValue)
 }
 
+// DescendIndexFrom iterates the transaction's view of the named index
+// in reverse order starting at the last entry <= the pivot pair.
+func (tx *Tx[K, V]) DescendIndexFrom(name string, pivotKey K, pivotValue V) iter.Seq2[K, V] {
+	return tx.iterIndex(name, true, true, pivotKey, pivotValue)
+}
+
 func (tx *Tx[K, V]) iterIndex(name string, desc, pivoted bool, pk K, pv V) iter.Seq2[K, V] {
 	return func(yield func(K, V) bool) {
 		if tx.done {
@@ -135,9 +147,12 @@ func (tx *Tx[K, V]) iterIndex(name string, desc, pivoted bool, pk K, pv V) iter.
 // skipping expired keys.
 func iterIndexTree[K cmp.Ordered, V any](s *dbState[K, V], ix *index[K, V], desc, pivoted bool, pk K, pv V, yield func(K, V) bool) {
 	seq := ix.tree.All()
-	if desc {
+	switch {
+	case desc && pivoted:
+		seq = ix.tree.Descend(ientry[K, V]{k: pk, v: pv})
+	case desc:
 		seq = ix.tree.Backward()
-	} else if pivoted {
+	case pivoted:
 		seq = ix.tree.Ascend(ientry[K, V]{k: pk, v: pv})
 	}
 	now := time.Now().UnixNano()

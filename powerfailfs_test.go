@@ -6,6 +6,8 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -25,18 +27,24 @@ import (
 //
 // Either way file contents survive only up to their last Sync.
 type powerFS struct {
-	mu   sync.Mutex
-	cur  map[string]*powerFile // directory as the process sees it
-	dur  map[string]*powerFile // directory as of the last SyncDir
-	cuts []fsCut
+	mu       sync.Mutex
+	cur      map[string]*powerFile // directory as the process sees it
+	dur      map[string]*powerFile // directory as of the last SyncDir
+	cuts     []fsCut
+	onCreate func() // if set, runs once right after the next Create (test hook)
 }
 
 // fsCut is one possible post-crash filesystem state: surviving bytes by
-// path, under each metadata-durability assumption.
+// path, under each metadata-durability assumption. The torn flavors
+// additionally keep a torn prefix of the compaction temp file's
+// unsynced bytes — the crash tearing the very content compaction was
+// streaming — while every other file stays at its last Sync.
 type fsCut struct {
-	label        string
-	conservative map[string][]byte
-	eager        map[string][]byte
+	label            string
+	conservative     map[string][]byte
+	eager            map[string][]byte
+	tornConservative map[string][]byte
+	tornEager        map[string][]byte
 }
 
 func newPowerFS() *powerFS {
@@ -44,14 +52,21 @@ func newPowerFS() *powerFS {
 }
 
 func (fs *powerFS) snapLocked(label string) fsCut {
-	view := func(dir map[string]*powerFile) map[string][]byte {
+	view := func(dir map[string]*powerFile, torn bool) map[string][]byte {
 		m := make(map[string][]byte, len(dir))
 		for p, f := range dir {
-			m[p] = f.durableSnapshot()
+			if torn && strings.HasSuffix(p, compactSuffix) {
+				m[p] = f.tornSnapshot()
+			} else {
+				m[p] = f.durableSnapshot()
+			}
 		}
 		return m
 	}
-	c := fsCut{label: label, conservative: view(fs.dur), eager: view(fs.cur)}
+	c := fsCut{label: label,
+		conservative: view(fs.dur, false), eager: view(fs.cur, false),
+		tornConservative: view(fs.dur, true), tornEager: view(fs.cur, true),
+	}
 	fs.cuts = append(fs.cuts, c)
 	return c
 }
@@ -90,10 +105,15 @@ func (fs *powerFS) OpenFile(path string) (logfile, error) {
 
 func (fs *powerFS) Create(path string) (logfile, error) {
 	fs.mu.Lock()
-	defer fs.mu.Unlock()
 	f := &powerFile{} // truncate semantics: a fresh inode replaces any old entry
 	fs.cur[path] = f
 	fs.snapLocked("create " + path)
+	hook := fs.onCreate
+	fs.onCreate = nil
+	fs.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	return &pfsFile{pf: f, fs: fs, name: path}, nil
 }
 
@@ -170,13 +190,16 @@ func (f *pfsFile) Close() error               { return f.pf.Close() }
 
 // TestPowerLossCompaction cuts power at every operation boundary of a
 // compaction — temp-file create, snapshot writes, temp sync, rename,
-// directory sync — under both metadata-durability assumptions, and
-// requires every cut to recover exactly the pre-compaction state:
-// compaction must never be able to lose or corrupt data, whichever of
-// the old and new logs survives. It then verifies that writes
-// acknowledged after the compaction survive a metadata-conservative
-// cut, proving the rename was made durable before the log accepted
-// them.
+// directory sync — under both metadata-durability assumptions, plus
+// torn variants where the temp file's unsynced content survives only
+// partially, and requires every cut to recover exactly the acknowledged
+// state: compaction must never be able to lose or corrupt data,
+// whichever of the old and new logs survives, however torn the temp
+// file. Writes racing the compaction land in the log tail that phase B
+// splices into the compacted file, so tail loss is detectable too. It
+// then verifies that writes acknowledged after the compaction survive a
+// metadata-conservative cut, proving the rename was made durable before
+// the log accepted them.
 func TestPowerLossCompaction(t *testing.T) {
 	const dbName = "sim.db"
 	pfs := newPowerFS()
@@ -222,18 +245,57 @@ func TestPowerLossCompaction(t *testing.T) {
 	}
 
 	scratch := t.TempDir()
+
+	// Race writes into the compaction window (right after the temp file
+	// is created, before the snapshot streams) so they land in the log
+	// tail phase B splices in. Each ack point records the cut index from
+	// which that write must be durable; cuts inside a write's own window
+	// may legitimately land on either side of its fsync.
+	type ackPoint struct {
+		atCut int
+		want  map[string]string
+	}
 	cutStart := pfs.cutCount()
+	acks := []ackPoint{{cutStart, maps.Clone(expected)}}
+	var tailErr error
+	pfs.onCreate = func() {
+		for i := range 3 {
+			k := fmt.Sprintf("tail%d", i)
+			if err := db.Set(k, "tv"); err != nil {
+				tailErr = err
+				return
+			}
+			expected[k] = "tv"
+			acks = append(acks, ackPoint{pfs.cutCount(), maps.Clone(expected)})
+		}
+	}
 	if err := db.Compact(); err != nil {
 		t.Fatal(err)
 	}
+	if tailErr != nil {
+		t.Fatal(tailErr)
+	}
+	if len(acks) != 4 {
+		t.Fatalf("tail writes did not run during compaction (%d ack points)", len(acks))
+	}
 	cuts := pfs.cutList()[cutStart:]
-	if len(cuts) < 4 { // create, write(s), sync, rename, syncdir
+	if len(cuts) < 10 { // create, tail write/sync pairs, snapshot+splice writes, sync, rename, syncdir
 		t.Fatalf("compaction recorded only %d cut points", len(cuts))
 	}
 	for i, c := range cuts {
+		m := 0
+		for m+1 < len(acks) && acks[m+1].atCut <= cutStart+i {
+			m++
+		}
+		wants := []map[string]string{acks[m].want}
+		if m+1 < len(acks) {
+			wants = append(wants, acks[m+1].want)
+		}
 		label := fmt.Sprintf("compact cut %d [%s]", i, c.label)
-		verifyFSCut(t, scratch, dbName, c.conservative, expected, label+" conservative")
-		verifyFSCut(t, scratch, dbName, c.eager, expected, label+" eager")
+		verifyFSCut(t, scratch, dbName, c.conservative, wants, label+" conservative")
+		verifyFSCut(t, scratch, dbName, c.eager, wants, label+" eager")
+		verifyFSCut(t, scratch, dbName, c.tornConservative, wants, label+" torn conservative")
+		verifyFSCut(t, scratch, dbName, c.tornEager, wants, label+" torn eager")
 	}
 
 	// Post-compaction acked writes must be durable even if no directory
@@ -245,9 +307,10 @@ func TestPowerLossCompaction(t *testing.T) {
 		}
 		expected[k] = "v"
 		c := pfs.cutNow("post write acked")
+		wants := []map[string]string{expected}
 		label := fmt.Sprintf("post-compaction write %d", i)
-		verifyFSCut(t, scratch, dbName, c.conservative, expected, label+" conservative")
-		verifyFSCut(t, scratch, dbName, c.eager, expected, label+" eager")
+		verifyFSCut(t, scratch, dbName, c.conservative, wants, label+" conservative")
+		verifyFSCut(t, scratch, dbName, c.eager, wants, label+" eager")
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
@@ -255,9 +318,12 @@ func TestPowerLossCompaction(t *testing.T) {
 }
 
 // verifyFSCut materializes one surviving filesystem state as real files,
-// opens the database, and checks it recovers want exactly, discards any
-// leftover compaction temp file, and accepts new writes.
-func verifyFSCut(t *testing.T, scratch, dbName string, files map[string][]byte, want map[string]string, label string) {
+// opens the database, and checks it recovers one of the candidate
+// states exactly, discards any leftover compaction temp file, and
+// accepts new writes. Multiple candidates arise only for cuts inside a
+// concurrent write's own ack window, where recovery may land on either
+// side of that write's fsync.
+func verifyFSCut(t *testing.T, scratch, dbName string, files map[string][]byte, wants []map[string]string, label string) {
 	t.Helper()
 	dir, err := os.MkdirTemp(scratch, "cut")
 	if err != nil {
@@ -279,13 +345,13 @@ func verifyFSCut(t *testing.T, scratch, dbName string, files map[string][]byte, 
 	if _, err := os.Stat(path + compactSuffix); !os.IsNotExist(err) {
 		t.Fatalf("%s: leftover compaction temp file not discarded", label)
 	}
-	if db.Len() != len(want) {
-		t.Fatalf("%s: recovered %d keys; want exactly %d", label, db.Len(), len(want))
+	got := maps.Collect(db.All())
+	if db.Len() != len(got) {
+		t.Fatalf("%s: Len %d disagrees with iteration count %d", label, db.Len(), len(got))
 	}
-	for k, wv := range want {
-		if v, ok := db.Get(k); !ok || v != wv {
-			t.Fatalf("%s: Get(%q) = %q, %v; want %q", label, k, v, ok, wv)
-		}
+	if !slices.ContainsFunc(wants, func(w map[string]string) bool { return maps.Equal(got, w) }) {
+		t.Fatalf("%s: recovered %d keys, matching none of the %d candidate states: %v",
+			label, len(got), len(wants), got)
 	}
 	if err := db.Set("probe", "ok"); err != nil {
 		t.Fatalf("%s: write after recovery: %v", label, err)
