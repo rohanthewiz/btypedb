@@ -130,11 +130,24 @@ func (pfInfo) ModTime() time.Time { return time.Time{} }
 func (pfInfo) IsDir() bool        { return false }
 func (pfInfo) Sys() any           { return nil }
 
+// logfileFS injects a fault-simulating log file; every other filesystem
+// operation hits the real OS.
+type logfileFS struct {
+	realFS
+	f logfile
+}
+
+func (l logfileFS) OpenFile(string) (logfile, error) { return l.f, nil }
+
 // withLogfile injects a fault-simulating log file (test seam).
 func withLogfile(f logfile) Option {
-	return func(o *options) {
-		o.openFile = func(string) (logfile, error) { return f, nil }
-	}
+	return func(o *options) { o.fs = logfileFS{f: f} }
+}
+
+// withFS injects a whole fault-simulating filesystem (test seam),
+// covering the compaction temp-file/rename path as well as the log.
+func withFS(fs fsys) Option {
+	return func(o *options) { o.fs = fs }
 }
 
 // TestPowerLossDurability is the durability half of the power-loss

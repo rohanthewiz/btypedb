@@ -104,17 +104,14 @@ func (tx *Tx[K, V]) Commit() error {
 		db.releaseState(tx.state)
 		return nil
 	}
-	defer db.writerMu.Unlock()
 
 	db.mu.Lock()
-	defer db.mu.Unlock()
-	if err := db.canWrite(); err != nil {
+	err := db.canWrite()
+	if err != nil || tx.nops == 0 {
 		tx.state.release()
+		db.mu.Unlock()
+		db.writerMu.Unlock()
 		return err
-	}
-	if tx.nops == 0 {
-		tx.state.release()
-		return nil
 	}
 
 	// A single op replays atomically on its own; a multi-op tx gets a
@@ -127,25 +124,21 @@ func (tx *Tx[K, V]) Commit() error {
 		db.wbuf = append(db.wbuf, tx.pending...)
 		buf = db.wbuf
 	}
-	if _, err := db.file.Write(buf); err != nil {
-		db.writeErr = err
+	if err := db.writeLog(buf); err != nil {
 		tx.state.release()
-		return serr.Wrap(err, "op", "tx log append")
+		db.mu.Unlock()
+		db.writerMu.Unlock()
+		return err
 	}
-	if db.policy == SyncAlways {
-		if err := db.file.Sync(); err != nil {
-			db.writeErr = err
-			tx.state.release()
-			return serr.Wrap(err, "op", "tx log sync")
-		}
-	}
-
 	old := db.state
 	db.state = tx.state
 	old.release()
-	db.walSize += int64(len(buf))
-	db.maybeAutoCompact()
-	return nil
+	seq := db.appendSeq
+	db.mu.Unlock()
+	db.writerMu.Unlock()
+
+	// Ack only once a group fsync covers this commit (SyncAlways).
+	return db.waitDurable(seq)
 }
 
 // Rollback discards the transaction's changes and releases its snapshot.
@@ -360,6 +353,53 @@ func (tx *Tx[K, V]) Values() iter.Seq[V] {
 			}
 		}
 	}
+}
+
+// Backward iterates the transaction's view in descending key order,
+// skipping expired keys.
+func (tx *Tx[K, V]) Backward() iter.Seq2[K, V] {
+	return func(yield func(K, V) bool) {
+		if tx.done {
+			return
+		}
+		now := time.Now().UnixNano()
+		for k, v := range tx.state.data.Backward() {
+			if tx.state.expired(k, now) {
+				continue
+			}
+			if !yield(k, v) {
+				return
+			}
+		}
+	}
+}
+
+// Descend iterates the transaction's view in descending order starting
+// at the last key <= from, skipping expired keys.
+func (tx *Tx[K, V]) Descend(from K) iter.Seq2[K, V] {
+	return func(yield func(K, V) bool) {
+		if tx.done {
+			return
+		}
+		now := time.Now().UnixNano()
+		for k, v := range tx.state.data.Descend(from) {
+			if tx.state.expired(k, now) {
+				continue
+			}
+			if !yield(k, v) {
+				return
+			}
+		}
+	}
+}
+
+// LiveLen returns the number of unexpired keys in the transaction's
+// view. Unlike Len it excludes expired keys not yet swept.
+func (tx *Tx[K, V]) LiveLen() int {
+	if tx.done {
+		return 0
+	}
+	return tx.state.liveLen(time.Now().UnixNano())
 }
 
 // Ascend iterates the transaction's view in ascending order starting at

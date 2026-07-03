@@ -39,8 +39,13 @@ var ErrClosed = errors.New("btypedb: database is closed")
 type SyncPolicy int
 
 const (
-	// SyncAlways fsyncs after every write. Durable to the last operation;
-	// slowest. This is the default.
+	// SyncAlways fsyncs before acknowledging every write, coalescing
+	// concurrent committers into shared fsyncs (group commit). Durable
+	// to the last acknowledged operation. A write becomes visible to
+	// readers when it is applied, slightly before its fsync completes,
+	// so a reader can briefly observe a committed write that a power cut
+	// in that window would lose; the writer itself is never acknowledged
+	// until the data is on disk. This is the default.
 	SyncAlways SyncPolicy = iota
 	// SyncEverySecond fsyncs on a one-second background ticker. A crash
 	// may lose up to the last second of writes.
@@ -72,7 +77,7 @@ type options struct {
 	compactMinSize   int64
 	compactGrowthPct int
 	sweepInterval    time.Duration
-	openFile         func(path string) (logfile, error) // test seam; nil = real file
+	fs               fsys // test seam; nil = the real filesystem
 }
 
 func defaultOptions() options {
@@ -138,15 +143,22 @@ type DB[K cmp.Ordered, V any] struct {
 	mu         sync.RWMutex
 	state      *dbState[K, V]
 	file       logfile
+	fs         fsys   // filesystem ops (real, or a fault-injecting test double)
 	wbuf       []byte // reusable record-encoding buffer, guarded by mu
 	walSize    int64  // bytes of valid log on disk
 	baseSize   int64  // log size just after the last compaction (or open)
+	appendSeq  uint64 // count of log appends; the group-commit watermark unit
 	closed     bool
 	compacting bool  // an auto-compaction goroutine is in flight
 	writeErr   error // sticky: after a failed log append the DB refuses writes
 	syncErr    error // last error from the background syncer, surfaced on Close
 	compactErr error // last error from auto-compaction, surfaced on Close
 	sweepErr   error // last error from the expiry sweeper, surfaced on Close
+
+	// gsync coalesces SyncAlways fsyncs across concurrent committers
+	// (group commit). It has its own lock, taken after mu when both are
+	// needed; it is never held while acquiring mu.
+	gsync groupSync
 
 	bgWG      sync.WaitGroup // in-flight auto-compactions
 	stopSync  chan struct{}
@@ -165,20 +177,23 @@ func Open[K cmp.Ordered, V any](path string, keyCodec Codec[K], valCodec Codec[V
 		opt(&o)
 	}
 
+	fs := o.fs
+	if fs == nil {
+		fs = realFS{}
+	}
+
 	// A leftover temp file means a compaction died before its atomic
 	// rename; it was never live, so discard it.
-	os.Remove(path + compactSuffix)
+	fs.Remove(path + compactSuffix)
 
-	openFile := o.openFile
-	if openFile == nil {
-		openFile = func(p string) (logfile, error) {
-			return os.OpenFile(p, os.O_RDWR|os.O_CREATE, 0o644)
-		}
-	}
-	f, err := openFile(path)
+	f, err := fs.OpenFile(path)
 	if err != nil {
 		return nil, serr.Wrap(err, "path", path)
 	}
+	// Persist the directory entry in case the file was just created:
+	// without this, a power cut could drop the file itself even though
+	// its contents were fsynced.
+	fs.SyncDir(path)
 
 	state := newDBState[K, V]()
 	validLen, err := replayLog(f, func(rec walRecord) error {
@@ -236,9 +251,11 @@ func Open[K cmp.Ordered, V any](path string, keyCodec Codec[K], valCodec Codec[V
 		sweepInterval:    o.sweepInterval,
 		state:            state,
 		file:             f,
+		fs:               fs,
 		walSize:          validLen,
 		baseSize:         validLen,
 	}
+	db.gsync.cond = sync.NewCond(&db.gsync.mu)
 	if db.policy == SyncEverySecond {
 		db.stopSync = make(chan struct{})
 		db.syncDone = make(chan struct{})
@@ -285,17 +302,21 @@ func (db *DB[K, V]) setInternal(key K, value V, deadline int64) error {
 	}
 
 	db.writerMu.Lock()
-	defer db.writerMu.Unlock()
 	db.mu.Lock()
-	defer db.mu.Unlock()
-	if err := db.canWrite(); err != nil {
+	err = db.canWrite()
+	if err == nil {
+		err = db.appendToLog(op, kb, vb)
+	}
+	if err == nil {
+		db.state.set(key, value, deadline)
+	}
+	seq := db.appendSeq
+	db.mu.Unlock()
+	db.writerMu.Unlock()
+	if err != nil {
 		return err
 	}
-	if err := db.appendToLog(op, kb, vb); err != nil {
-		return err
-	}
-	db.state.set(key, value, deadline)
-	return nil
+	return db.waitDurable(seq)
 }
 
 // TTL returns the remaining time-to-live for key. ok is false when the
@@ -322,20 +343,30 @@ func (db *DB[K, V]) Delete(key K) (existed bool, err error) {
 	now := time.Now().UnixNano()
 
 	db.writerMu.Lock()
-	defer db.writerMu.Unlock()
 	db.mu.Lock()
-	defer db.mu.Unlock()
-	if err := db.canWrite(); err != nil {
-		return false, err
-	}
-	if !db.state.data.Contains(key) {
+	err = db.canWrite()
+	if err == nil && !db.state.data.Contains(key) {
+		db.mu.Unlock()
+		db.writerMu.Unlock()
 		return false, nil
 	}
-	visible := !db.state.expired(key, now)
-	if err := db.appendToLog(opDelete, kb, nil); err != nil {
+	var visible bool
+	if err == nil {
+		visible = !db.state.expired(key, now)
+		err = db.appendToLog(opDelete, kb, nil)
+	}
+	if err == nil {
+		db.state.delete(key)
+	}
+	seq := db.appendSeq
+	db.mu.Unlock()
+	db.writerMu.Unlock()
+	if err != nil {
 		return false, err
 	}
-	db.state.delete(key)
+	if err := db.waitDurable(seq); err != nil {
+		return false, err
+	}
 	return visible, nil
 }
 
@@ -450,6 +481,52 @@ func (db *DB[K, V]) Ascend(from K) iter.Seq2[K, V] {
 	}
 }
 
+// Backward iterates every unexpired key-value pair in descending key
+// order. The same locking caveat as All applies.
+func (db *DB[K, V]) Backward() iter.Seq2[K, V] {
+	return func(yield func(K, V) bool) {
+		now := time.Now().UnixNano()
+		db.mu.RLock()
+		defer db.mu.RUnlock()
+		for k, v := range db.state.data.Backward() {
+			if db.state.expired(k, now) {
+				continue
+			}
+			if !yield(k, v) {
+				return
+			}
+		}
+	}
+}
+
+// Descend iterates in descending order starting at the last key <= from.
+// The same locking caveat as All applies.
+func (db *DB[K, V]) Descend(from K) iter.Seq2[K, V] {
+	return func(yield func(K, V) bool) {
+		now := time.Now().UnixNano()
+		db.mu.RLock()
+		defer db.mu.RUnlock()
+		for k, v := range db.state.data.Descend(from) {
+			if db.state.expired(k, now) {
+				continue
+			}
+			if !yield(k, v) {
+				return
+			}
+		}
+	}
+}
+
+// LiveLen returns the number of unexpired keys. Unlike Len it excludes
+// expired keys the sweeper has not removed yet, at a cost proportional
+// to the number of such keys.
+func (db *DB[K, V]) LiveLen() int {
+	now := time.Now().UnixNano()
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.state.liveLen(now)
+}
+
 // Sync forces an fsync of the write-ahead log.
 func (db *DB[K, V]) Sync() error {
 	db.mu.Lock()
@@ -460,6 +537,7 @@ func (db *DB[K, V]) Sync() error {
 	if err := db.file.Sync(); err != nil {
 		return serr.Wrap(err, "op", "sync")
 	}
+	db.markDurable()
 	return nil
 }
 
@@ -495,6 +573,10 @@ func (db *DB[K, V]) Close() error {
 	}
 	if err := db.file.Sync(); err != nil {
 		errs = append(errs, serr.Wrap(err, "op", "final sync"))
+	} else {
+		// Release any group-commit waiters still in flight: their data
+		// is on disk now.
+		db.markDurable()
 	}
 	if err := db.file.Close(); err != nil {
 		errs = append(errs, serr.Wrap(err, "op", "close file"))
@@ -521,22 +603,25 @@ func (db *DB[K, V]) releaseState(st *dbState[K, V]) {
 	db.mu.Unlock()
 }
 
-// appendToLog frames and writes one record, fsyncing per policy.
-// Callers must hold mu. On failure the record may be torn on disk; the
-// DB goes read-only and the tail is repaired on next open.
+// appendToLog frames and writes one record. Callers must hold mu.
+// Under SyncAlways the record is acknowledged by a later waitDurable
+// call, made after the locks are released, so concurrent committers
+// share fsyncs (group commit).
 func (db *DB[K, V]) appendToLog(op byte, key, val []byte) error {
 	db.wbuf = appendRecord(db.wbuf[:0], op, key, val)
-	if _, err := db.file.Write(db.wbuf); err != nil {
+	return db.writeLog(db.wbuf)
+}
+
+// writeLog appends framed bytes to the log, bumping the group-commit
+// sequence. Callers must hold mu. On failure the record may be torn on
+// disk; the DB goes read-only and the tail is repaired on next open.
+func (db *DB[K, V]) writeLog(buf []byte) error {
+	if _, err := db.file.Write(buf); err != nil {
 		db.writeErr = err
 		return serr.Wrap(err, "op", "log append")
 	}
-	if db.policy == SyncAlways {
-		if err := db.file.Sync(); err != nil {
-			db.writeErr = err
-			return serr.Wrap(err, "op", "log sync")
-		}
-	}
-	db.walSize += int64(len(db.wbuf))
+	db.appendSeq++
+	db.walSize += int64(len(buf))
 	db.maybeAutoCompact()
 	return nil
 }

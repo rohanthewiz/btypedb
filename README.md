@@ -31,8 +31,13 @@ for k, u := range db.Ascend("m") { // every key >= "m", ascending
     _ = k
     _ = u
 }
+for k, u := range db.Descend("m") { /* every key <= "m", descending */ }
+for k, u := range db.Backward() { /* all pairs, descending */ }
 for k := range db.Keys() { _ = k }   // ascending keys
 for u := range db.Values() { _ = u } // values in key order
+
+n := db.Len()      // stored keys (expired-but-unswept included)
+n = db.LiveLen()   // unexpired keys only
 ```
 
 Codecs only define the on-disk encoding; in-memory ordering is the key
@@ -119,9 +124,19 @@ replays all-or-nothing. Also available as `tx.DeleteRange`.
 btypedb.Open(path, kc, vc, btypedb.WithSyncPolicy(btypedb.SyncEverySecond))
 ```
 
-- `SyncAlways` (default) — fsync every write; durable to the last op
+- `SyncAlways` (default) — fsync before acking every write; durable to
+  the last acknowledged op
 - `SyncEverySecond` — background fsync; a crash loses ≤1s of writes
 - `SyncNever` — the OS decides
+
+Under `SyncAlways`, concurrent committers share fsyncs (**group
+commit**): each write is acknowledged only once an fsync covers it, but
+one fsync releases every writer queued behind it, so N concurrent
+writers cost far fewer than N fsyncs. The one visible consequence: a
+committed write becomes readable slightly before its fsync completes,
+so a concurrent reader can briefly observe a write that a power cut in
+that window would lose. The writer itself is never acknowledged until
+the data is on disk.
 
 ### Compaction
 
@@ -166,6 +181,7 @@ all-or-nothing: a tear anywhere inside it discards the whole group.
 - [x] **Phase 3**: background + manual compaction (snapshot rewrite with atomic swap), SIGKILL crash-test suite
 - [x] **Phase 4**: secondary indexes, atomic range-delete, TTL with background sweeper (deadline-ordered `btype.Table`)
 - [x] **v0.1.0 prep**: btype version pin with guard test, power-loss fault-injection harness, `Keys()`/`Values()` iterators
+- [x] **v0.2.0 prep**: `Descend`/`Backward` reverse iteration, expired-aware `LiveLen`, group commit (fsync coalescing across concurrent writers), power-loss fault injection for the compaction temp-file/rename path
 
 ## Crash safety testing
 
@@ -184,6 +200,16 @@ Two layers beyond ordinary unit tests:
   torn mid-record cuts and garbage tails. The consistency test opens
   every byte-length prefix of a real log and checks transactions are
   applied all-or-nothing.
+- **Compaction power-loss harness** (`powerfailfs_test.go`): a
+  fault-injecting *filesystem* extends the model to directory metadata —
+  file contents are durable only after the file's fsync, and
+  create/rename/remove only after the directory's. Power is cut at
+  every operation boundary of a compaction under both a
+  metadata-conservative and a metadata-eager assumption; every cut must
+  recover the exact pre-compaction state, and writes acknowledged after
+  the compaction must survive even if no later metadata persisted
+  (verifying the temp file is fsynced before the rename, and the
+  directory after it).
 
 ## Dependency pin
 

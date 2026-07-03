@@ -133,6 +133,20 @@ func (s *dbState[K, V]) delete(k K) (prev V, present bool) {
 	return prev, true
 }
 
+// liveLen counts keys that are not expired as of now. Every ttl/exp
+// entry corresponds to a present data key, so the count is the tree
+// size minus the expired prefix of the deadline-ordered exp tree.
+func (s *dbState[K, V]) liveLen(now int64) int {
+	n := s.data.Len()
+	for e := range s.exp.All() {
+		if e.at > now {
+			break
+		}
+		n--
+	}
+	return n
+}
+
 // expired reports whether k carries a deadline at or before now.
 func (s *dbState[K, V]) expired(k K, now int64) bool {
 	if s.ttl.Len() == 0 {

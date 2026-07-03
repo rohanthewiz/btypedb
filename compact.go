@@ -4,8 +4,6 @@ import (
 	"bufio"
 	"errors"
 	"io"
-	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/rohanthewiz/serr"
@@ -41,14 +39,14 @@ func (db *DB[K, V]) Compact() error {
 	db.mu.Unlock()
 
 	tmpPath := db.path + compactSuffix
-	tmp, err := os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	tmp, err := db.fs.Create(tmpPath)
 	if err != nil {
 		db.releaseState(snap)
 		return serr.Wrap(err, "path", tmpPath)
 	}
 	discard := func() {
 		tmp.Close()
-		os.Remove(tmpPath)
+		db.fs.Remove(tmpPath)
 	}
 
 	// Stream the snapshot with no locks held: it is immutable, and
@@ -83,15 +81,18 @@ func (db *DB[K, V]) Compact() error {
 		discard()
 		return serr.Wrap(err, "op", "sync compacted log")
 	}
-	if err := os.Rename(tmpPath, db.path); err != nil {
+	if err := db.fs.Rename(tmpPath, db.path); err != nil {
 		discard()
 		return serr.Wrap(err, "op", "swap compacted log")
 	}
-	syncDir(db.path)
+	db.fs.SyncDir(db.path)
 	db.file.Close() // old inode, now unlinked
 	db.file = tmp   // handle followed the rename; positioned at end
 	db.walSize = snapBytes + tailLen
 	db.baseSize = db.walSize
+	// The new file holds every append so far, synced before the rename:
+	// release any group-commit waiters whose handle we just retired.
+	db.markDurable()
 	return nil
 }
 
@@ -154,15 +155,4 @@ func (db *DB[K, V]) maybeAutoCompact() {
 		}
 		db.mu.Unlock()
 	})
-}
-
-// syncDir persists a rename in path's directory. Best effort: directory
-// fsync is not supported everywhere.
-func syncDir(path string) {
-	d, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return
-	}
-	d.Sync()
-	d.Close()
 }
