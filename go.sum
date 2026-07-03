@@ -1,0 +1,4 @@
+github.com/rohanthewiz/serr v1.3.0 h1:gCKIHw0XFOmPifLq0oocx5RDi6iT7AxzVGT+9z3liO4=
+github.com/rohanthewiz/serr v1.3.0/go.mod h1:l01AbjXw1zP0kxe5tX5s/sADHiBbl0Rwfo/igde4b88=
+github.com/tidwall/btype v0.3.0 h1:VU0/oeVecbqY+2OpyzN0wPQU9CBvCnmOv3w5A+pn42A=
+github.com/tidwall/btype v0.3.0/go.mod h1:IRq7GmniRp9OhEKPIalEyUe/3x9oR8AuuKrdv0ANFbc=
