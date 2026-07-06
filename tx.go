@@ -35,6 +35,7 @@ type Tx[K cmp.Ordered, V any] struct {
 	writable bool
 	pending  []byte // framed WAL records accumulated by this tx
 	nops     uint64
+	saves    []*Savepoint[K, V] // outstanding savepoints, oldest first
 	done     bool
 }
 
@@ -101,11 +102,15 @@ func (tx *Tx[K, V]) Commit() error {
 	db := tx.db
 
 	if !tx.writable {
-		db.releaseState(tx.state)
+		db.mu.Lock()
+		tx.releaseSaves()
+		tx.state.release()
+		db.mu.Unlock()
 		return nil
 	}
 
 	db.mu.Lock()
+	tx.releaseSaves()
 	err := db.canWrite()
 	if err != nil || tx.nops == 0 {
 		tx.state.release()
@@ -148,7 +153,10 @@ func (tx *Tx[K, V]) Rollback() error {
 		return nil
 	}
 	tx.done = true
-	tx.db.releaseState(tx.state)
+	tx.db.mu.Lock()
+	tx.releaseSaves()
+	tx.state.release()
+	tx.db.mu.Unlock()
 	if tx.writable {
 		tx.db.writerMu.Unlock()
 	}

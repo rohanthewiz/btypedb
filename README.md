@@ -70,12 +70,22 @@ err = db.Update(func(tx *btypedb.Tx[string, User]) error {
 tx, err := db.Begin(true) // true = writable
 // ... tx.Set / tx.Delete / tx.Get ...
 err = tx.Commit()         // or tx.Rollback()
+
+// Savepoints: mark a point, keep working, rewind if needed. A mark is
+// an O(1) COW snapshot, so both Savepoint and RollbackTo are O(1).
+sp, err := tx.Savepoint()
+// ... more tx writes ...
+err = tx.RollbackTo(sp) // discard writes since the mark; sp stays valid
+err = tx.Release(sp)    // or: drop the mark, keep the writes
 ```
 
 Writable transactions serialize with each other (single writer) and hold
 their writes invisibly until Commit. Readers never block and never take
 locks while iterating. Multi-op commits are framed as an atomic batch in
 the log, so crash recovery applies a transaction all-or-nothing.
+Savepoints nest — rolling back to (or releasing) an earlier mark
+destroys the later ones — and RollbackTo also truncates the pending log
+batch, so the eventual commit logs exactly the surviving writes.
 
 ### TTL
 
@@ -178,7 +188,7 @@ all-or-nothing: a tear anywhere inside it discards the whole group.
 ## Roadmap
 
 - [x] **Phase 1**: Open/Close, Get/Set/Delete, WAL append + replay, torn-tail recovery, sync policies, ordered iteration
-- [x] **Phase 2**: transactions via btype's O(1) COW snapshots (`Begin/Commit/Rollback`, `View`/`Update`), lock-free read snapshots, atomic batch commits, batched fsync
+- [x] **Phase 2**: transactions via btype's O(1) COW snapshots (`Begin/Commit/Rollback`, `View`/`Update`), lock-free read snapshots, atomic batch commits, batched fsync; savepoints (`Savepoint`/`RollbackTo`/`Release`) as O(1) COW marks with pending-batch truncation
 - [x] **Phase 3**: background + manual compaction (snapshot rewrite with atomic swap), SIGKILL crash-test suite
 - [x] **Phase 4**: secondary indexes, atomic range-delete, TTL with background sweeper (deadline-ordered `btype.Table`)
 - [x] **v0.1.0 prep**: btype version pin with guard test, power-loss fault-injection harness, `Keys()`/`Values()` iterators
