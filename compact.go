@@ -49,6 +49,14 @@ func (db *DB[K, V]) Compact() error {
 		db.fs.Remove(tmpPath)
 	}
 
+	// The compacted file always begins with the current-format header —
+	// this is also how legacy pre-header files get upgraded in place.
+	if _, err := tmp.Write(logHeader()); err != nil {
+		db.releaseState(snap)
+		discard()
+		return serr.Wrap(err, "op", "write compacted log header")
+	}
+
 	// Stream the snapshot with no locks held: it is immutable, and
 	// writers keep appending to the live log meanwhile.
 	snapBytes, err := db.writeSnapshot(tmp, snap)
@@ -88,7 +96,7 @@ func (db *DB[K, V]) Compact() error {
 	db.fs.SyncDir(db.path)
 	db.file.Close() // old inode, now unlinked
 	db.file = tmp   // handle followed the rename; positioned at end
-	db.walSize = snapBytes + tailLen
+	db.walSize = logHeaderSize + snapBytes + tailLen
 	db.baseSize = db.walSize
 	// The new file holds every append so far, synced before the rename:
 	// release any group-commit waiters whose handle we just retired.

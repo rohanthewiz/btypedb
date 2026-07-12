@@ -300,8 +300,8 @@ func TestTxEmptyCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fi.Size() != 0 {
-		t.Fatalf("empty commit wrote %d bytes to the log", fi.Size())
+	if fi.Size() != logHeaderSize {
+		t.Fatalf("empty commit wrote %d bytes past the header", fi.Size()-logHeaderSize)
 	}
 	// Writer lock released.
 	if err := db.Set("k", "v"); err != nil {

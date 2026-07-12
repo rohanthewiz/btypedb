@@ -35,6 +35,18 @@ import (
 // ErrClosed is returned by operations on a closed database.
 var ErrClosed = errors.New("btypedb: database is closed")
 
+// ErrCorrupt is returned by Open when the log is damaged in a way that
+// truncation cannot safely repair: an intact record follows a corrupt
+// one (mid-file corruption such as bitrot), or the file header itself
+// fails its checksum. A plain torn tail — the normal result of a crash
+// mid-append — is not this error; it is repaired silently. Test with
+// errors.Is.
+var ErrCorrupt = errors.New("btypedb: log file is corrupt")
+
+// ErrNewerFormat is returned by Open when the log file was written by a
+// newer btypedb with an incompatible on-disk format. Test with errors.Is.
+var ErrNewerFormat = errors.New("btypedb: log file format is newer than this btypedb supports")
+
 // SyncPolicy controls when the write-ahead log is fsynced.
 type SyncPolicy int
 
@@ -72,12 +84,13 @@ type logfile interface {
 type Option func(*options)
 
 type options struct {
-	syncPolicy       SyncPolicy
-	autoCompact      bool
-	compactMinSize   int64
-	compactGrowthPct int
-	sweepInterval    time.Duration
-	fs               fsys // test seam; nil = the real filesystem
+	syncPolicy        SyncPolicy
+	autoCompact       bool
+	compactMinSize    int64
+	compactGrowthPct  int
+	sweepInterval     time.Duration
+	truncateAtCorrupt bool
+	fs                fsys // test seam; nil = the real filesystem
 }
 
 func defaultOptions() options {
@@ -110,6 +123,15 @@ func WithAutoCompact(minSize int64, growthPct int) Option {
 // still be called manually.
 func WithAutoCompactDisabled() Option {
 	return func(o *options) { o.autoCompact = false }
+}
+
+// WithTruncateAtCorruption makes Open repair mid-file corruption by
+// discarding everything from the first corrupt record onward, instead
+// of refusing with ErrCorrupt. This trades data for availability: every
+// record past the damage — including intact ones — is lost. Reserve it
+// for deliberate salvage, ideally on a copy of the file.
+func WithTruncateAtCorruption() Option {
+	return func(o *options) { o.truncateAtCorrupt = true }
 }
 
 // WithSweepInterval sets how often the background sweeper physically
@@ -195,8 +217,21 @@ func Open[K cmp.Ordered, V any](path string, keyCodec Codec[K], valCodec Codec[V
 	// its contents were fsynced.
 	fs.SyncDir(path)
 
+	// Classify the file by its header: freshly created (write one),
+	// current format (records start after it), legacy pre-header format
+	// (records start at 0), wrong version, or corrupt header.
+	dataStart, err := prepareHeader(f)
+	if err != nil {
+		f.Close()
+		return nil, serr.Wrap(err, "path", path)
+	}
+	if _, err := f.Seek(dataStart, io.SeekStart); err != nil {
+		f.Close()
+		return nil, serr.Wrap(err, "path", path)
+	}
+
 	state := newDBState[K, V]()
-	validLen, err := replayLog(f, func(rec walRecord) error {
+	validLen, parsedLen, err := replayLog(f, func(rec walRecord) error {
 		key, err := keyCodec.Decode(rec.key)
 		if err != nil {
 			return serr.Wrap(err, "decoding", "key")
@@ -226,6 +261,32 @@ func Open[K cmp.Ordered, V any](path string, keyCodec Codec[K], valCodec Codec[V
 	if err != nil {
 		f.Close()
 		return nil, serr.Wrap(err, "path", path)
+	}
+	validLen += dataStart
+	parsedLen += dataStart
+
+	// Unparseable bytes past the last intact record are either a torn
+	// tail (crash mid-append — repair by truncating) or mid-file
+	// corruption (bitrot — an intact record survives past the damage,
+	// and truncating would silently discard it along with everything
+	// after). Scan the remainder to tell them apart before touching the
+	// file. The remainder is read whole: in the normal torn-tail case it
+	// is at most one partial record, and in the corruption case we are
+	// on the way to refusing the open anyway.
+	if fi, err := f.Stat(); err == nil && fi.Size() > parsedLen && !o.truncateAtCorrupt {
+		tail, err := io.ReadAll(io.NewSectionReader(f, parsedLen, fi.Size()-parsedLen))
+		if err != nil {
+			f.Close()
+			return nil, serr.Wrap(err, "path", path, "op", "read unparsed tail")
+		}
+		if rel, found := scanForRecord(tail); found {
+			f.Close()
+			return nil, serr.Wrap(ErrCorrupt, "path", path,
+				"corruptAt", itoa64(parsedLen),
+				"intactRecordAt", itoa64(parsedLen+rel),
+				"bytesAtRisk", itoa64(fi.Size()-parsedLen),
+				"hint", "an intact record follows the damage; open with WithTruncateAtCorruption to salvage by discarding everything past it")
+		}
 	}
 
 	// Discard any torn tail, then position for appends.
