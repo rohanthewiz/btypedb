@@ -169,6 +169,7 @@ type DB[K cmp.Ordered, V any] struct {
 	wbuf       []byte // reusable record-encoding buffer, guarded by mu
 	walSize    int64  // bytes of valid log on disk
 	baseSize   int64  // log size just after the last compaction (or open)
+	fileEpoch  uint64 // bumped each time the log file is swapped (compaction); see replication.go
 	appendSeq  uint64 // count of log appends; the group-commit watermark unit
 	closed     bool
 	compacting bool  // an auto-compaction goroutine is in flight

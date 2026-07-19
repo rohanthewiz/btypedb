@@ -98,6 +98,10 @@ func (db *DB[K, V]) Compact() error {
 	db.file = tmp   // handle followed the rename; positioned at end
 	db.walSize = logHeaderSize + snapBytes + tailLen
 	db.baseSize = db.walSize
+	// The bytes of the new file share nothing with the old one, so any
+	// offset a replication follower holds is now meaningless — bump the
+	// epoch so its next ReadLogRange fails fast with ErrEpochChanged.
+	db.fileEpoch++
 	// The new file holds every append so far, synced before the rename:
 	// release any group-commit waiters whose handle we just retired.
 	db.markDurable()
