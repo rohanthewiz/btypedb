@@ -49,9 +49,10 @@ func (db *DB[K, V]) Compact() error {
 		db.fs.Remove(tmpPath)
 	}
 
-	// The compacted file always begins with the current-format header —
-	// this is also how legacy pre-header files get upgraded in place.
-	if _, err := tmp.Write(logHeader()); err != nil {
+	// The compacted file always begins with the current-format header — v1
+	// for a plaintext log, v2 (with a fresh key-check value) for an encrypted
+	// one. This is also how legacy pre-header files get upgraded in place.
+	if _, err := tmp.Write(headerFor(db.cipher)); err != nil {
 		db.releaseState(snap)
 		discard()
 		return serr.Wrap(err, "op", "write compacted log header")
@@ -96,7 +97,9 @@ func (db *DB[K, V]) Compact() error {
 	db.fs.SyncDir(db.path)
 	db.file.Close() // old inode, now unlinked
 	db.file = tmp   // handle followed the rename; positioned at end
-	db.walSize = logHeaderSize + snapBytes + tailLen
+	// The header is 16 bytes for a plaintext log, 44 for an encrypted one;
+	// size it from the same image just written above.
+	db.walSize = int64(len(headerFor(db.cipher))) + snapBytes + tailLen
 	db.baseSize = db.walSize
 	// The bytes of the new file share nothing with the old one, so any
 	// offset a replication follower holds is now meaningless — bump the
@@ -132,7 +135,12 @@ func (db *DB[K, V]) writeSnapshot(f io.Writer, snap *dbState[K, V]) (int64, erro
 		if dl, hasTTL := snap.ttl.Get(k); hasTTL {
 			op, vb = opSetTTL, prependDeadline(dl, vb)
 		}
-		rec = appendRecord(rec[:0], op, kb, vb)
+		// Re-seal from plaintext with a fresh nonce; this is also the
+		// re-encrypt seam that a future key rotation would ride on.
+		rec, err = appendSealedRecord(rec[:0], db.cipher, op, kb, vb)
+		if err != nil {
+			return 0, serr.Wrap(err, "op", "seal snapshot record")
+		}
 		if _, err := w.Write(rec); err != nil {
 			return 0, serr.Wrap(err, "op", "write snapshot record")
 		}

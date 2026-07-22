@@ -67,9 +67,22 @@ const (
 )
 
 const (
-	logMagic         = "btydbLOG" // first byte 'b' is outside the 1..4 op range, so a legacy log can never start with it
-	logFormatVersion = 1
-	logHeaderSize    = 16 // magic(8) + version(4) + crc(4)
+	logMagic = "btydbLOG" // first byte 'b' is outside the 1..4 op range, so a legacy log can never start with it
+
+	// plainFormatVersion tags an unencrypted log — the original v1 layout
+	// (magic|version|crc, 16 bytes). encFormatVersion tags an encrypted log,
+	// whose header additionally carries the cipher flags and a key-check
+	// value (see walCipher.header in encrypt.go). logFormatVersion is the
+	// highest version this build understands; a file numbered above it is
+	// refused with ErrNewerFormat — which is precisely how an older,
+	// encryption-unaware binary (whose logFormatVersion is still 1) rejects
+	// an encrypted v2 file.
+	plainFormatVersion = 1
+	encFormatVersion   = 2
+	logFormatVersion   = 2
+
+	logHeaderSize   = 16 // v1: magic(8) + version(4) + crc(4)
+	logHeaderSizeV2 = 44 // v2: magic(8) + version(4) + flags(4) + kcv(24) + crc(4)
 )
 
 // logHeader returns the header for a freshly written log file. For the
@@ -78,26 +91,36 @@ const (
 func logHeader() []byte {
 	h := make([]byte, 0, logHeaderSize)
 	h = append(h, logMagic...)
-	h = binary.LittleEndian.AppendUint32(h, logFormatVersion)
+	h = binary.LittleEndian.AppendUint32(h, plainFormatVersion)
 	return binary.LittleEndian.AppendUint32(h, crc32.ChecksumIEEE(h))
 }
 
 // prepareHeader classifies the just-opened log file by its header and
-// returns the offset where records begin. An empty file gets the
-// current header written and synced (before any record can follow it,
-// so a headerless-but-nonempty new-format file can never exist). A
-// strict prefix of the constant v1 header means the creating process
-// crashed between writing the header and syncing it — no record was
-// ever acknowledged, so start the file over. Anything else that does
-// not open with the magic is a legacy pre-header log whose records
-// start at offset 0.
-func prepareHeader(f logfile) (dataStart int64, err error) {
+// returns the offset where records begin. wc carries the caller's
+// encryption configuration (nil = open as plaintext) and decides which
+// header the file is expected to have.
+//
+// An empty file gets the appropriate header (v1 plaintext, or v2 encrypted
+// when a key was supplied) written and synced before any record can follow
+// it, so a headerless-but-nonempty new-format file can never exist. A strict
+// prefix of the header image we would write means the creating process
+// crashed between writing the header and syncing it — no record was ever
+// acknowledged, so start the file over. Anything that does not open with the
+// magic is a legacy pre-header log whose records start at offset 0.
+//
+// The header also reconciles the file's encryption state with the caller's
+// key, failing fast — before any record is read — with ErrKeyRequired (an
+// encrypted file opened without a key), ErrNotEncrypted (a plaintext file
+// opened with a key), ErrCipherMismatch (cipher/scope disagreement), or
+// ErrWrongKey (the header's key-check value does not match the supplied key).
+func prepareHeader(f logfile, wc *walCipher) (dataStart int64, err error) {
 	fi, err := f.Stat()
 	if err != nil {
 		return 0, serr.Wrap(err, "op", "stat log")
 	}
 	size := fi.Size()
-	hdr := logHeader()
+	expected := headerFor(wc) // the image WE would write for this config
+	hdrSize := int64(len(expected))
 
 	writeFresh := func() (int64, error) {
 		if err := f.Truncate(0); err != nil {
@@ -106,41 +129,48 @@ func prepareHeader(f logfile) (dataStart int64, err error) {
 		if _, err := f.Seek(0, io.SeekStart); err != nil {
 			return 0, serr.Wrap(err, "op", "seek for log header")
 		}
-		if _, err := f.Write(hdr); err != nil {
+		if _, err := f.Write(expected); err != nil {
 			return 0, serr.Wrap(err, "op", "write log header")
 		}
 		if err := f.Sync(); err != nil {
 			return 0, serr.Wrap(err, "op", "sync log header")
 		}
-		return logHeaderSize, nil
+		return hdrSize, nil
 	}
 
 	if size == 0 {
 		return writeFresh()
 	}
 
-	got := make([]byte, min(size, logHeaderSize))
+	// Read up to a full v2 header so we can classify either format.
+	got := make([]byte, min(size, int64(logHeaderSizeV2)))
 	if _, err := f.ReadAt(got, 0); err != nil {
 		return 0, serr.Wrap(err, "op", "read log header")
 	}
 
-	if size < logHeaderSize {
-		if bytes.Equal(got, hdr[:size]) {
-			return writeFresh() // torn header write; nothing was ever live
+	// A strict prefix of exactly what we would write, with nothing after it:
+	// the header write tore during first creation and nothing was ever live.
+	if size < hdrSize && bytes.Equal(got, expected[:size]) {
+		return writeFresh()
+	}
+
+	// Shorter than a v1 prefix, or not opening with the magic → legacy
+	// pre-header log, records at offset 0. A key cannot open a plaintext file.
+	if size < logHeaderSize || !bytes.Equal(got[:len(logMagic)], []byte(logMagic)) {
+		if wc != nil {
+			return 0, serr.Wrap(ErrNotEncrypted, "state", "database is not encrypted but an encryption key was supplied")
 		}
-		return 0, nil // legacy: shorter than a header, records (if any) start at 0
+		return 0, nil
 	}
-	if !bytes.Equal(got[:len(logMagic)], []byte(logMagic)) {
-		return 0, nil // legacy pre-header log
-	}
-	version := binary.LittleEndian.Uint32(got[8:12])
+
+	// The 16-byte compatibility prefix — magic(8) | version(4) | crc(4) over
+	// the first 12 — is identical in every format, so the checksum is
+	// validated the same way for v1 and v2, and BEFORE the version is trusted.
+	// A bad checksum is a torn or junk header (a crash during creation with
+	// sector junk past the tear), never a "newer format": no record ever
+	// existed (the header is synced before the first record), unless an intact
+	// record survives past it, which means mid-file corruption instead.
 	if crc32.ChecksumIEEE(got[:12]) != binary.LittleEndian.Uint32(got[12:16]) {
-		// A bad header checksum is either bitrot on a live database or a
-		// header write that tore during first creation with sector junk
-		// persisted past the tear — in which case no record ever existed
-		// (the header is synced before the first record can be written).
-		// An intact record anywhere beyond the header is what separates
-		// the two.
 		rest, err := io.ReadAll(io.NewSectionReader(f, logHeaderSize, size-logHeaderSize))
 		if err != nil {
 			return 0, serr.Wrap(err, "op", "read past corrupt header")
@@ -150,11 +180,40 @@ func prepareHeader(f logfile) (dataStart int64, err error) {
 		}
 		return writeFresh()
 	}
+
+	// Prefix checksum good: the version field is trustworthy.
+	version := binary.LittleEndian.Uint32(got[8:12])
 	if version > logFormatVersion {
 		return 0, serr.Wrap(ErrNewerFormat,
 			"fileVersion", itoa(int(version)), "supported", itoa(logFormatVersion))
 	}
-	return logHeaderSize, nil
+	fileEncrypted := version >= encFormatVersion
+	switch {
+	case fileEncrypted && wc == nil:
+		return 0, serr.Wrap(ErrKeyRequired, "state", "database is encrypted but no encryption key was supplied")
+	case !fileEncrypted && wc != nil:
+		return 0, serr.Wrap(ErrNotEncrypted, "state", "database is not encrypted but an encryption key was supplied")
+	}
+	if !fileEncrypted {
+		return logHeaderSize, nil // v1: records begin right after the prefix
+	}
+
+	// Encrypted (v2): flags and the KCV trail the compatibility prefix.
+	if size < logHeaderSizeV2 {
+		// A valid prefix but the v2 header is incomplete. Records can only
+		// begin at logHeaderSizeV2, so nothing was ever live → torn creation.
+		return writeFresh()
+	}
+	// flags and KCV are deterministic in the key, so an exact compare against
+	// the image we would write proves both the cipher/scope configuration and
+	// the key itself before any record is touched.
+	if !bytes.Equal(got[hdrFlagsOffset:hdrKCVOffset], expected[hdrFlagsOffset:hdrKCVOffset]) {
+		return 0, serr.Wrap(ErrCipherMismatch, "state", "encryption cipher or scope does not match the database header")
+	}
+	if !bytes.Equal(got[hdrKCVOffset:logHeaderSizeV2], expected[hdrKCVOffset:logHeaderSizeV2]) {
+		return 0, serr.Wrap(ErrWrongKey, "state", "encryption key does not match the database")
+	}
+	return logHeaderSizeV2, nil
 }
 
 // prependDeadline returns val prefixed with the encoded expiry deadline,

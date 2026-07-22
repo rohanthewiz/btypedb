@@ -216,7 +216,10 @@ func (tx *Tx[K, V]) setInternal(key K, value V, deadline int64) error {
 	if deadline > 0 {
 		op, vb = opSetTTL, prependDeadline(deadline, vb)
 	}
-	tx.pending = appendRecord(tx.pending, op, kb, vb)
+	tx.pending, err = appendSealedRecord(tx.pending, tx.db.cipher, op, kb, vb)
+	if err != nil {
+		return serr.Wrap(err, "op", "seal record")
+	}
 	tx.nops++
 	tx.state.set(key, value, deadline)
 	return nil

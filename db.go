@@ -47,6 +47,21 @@ var ErrCorrupt = errors.New("btypedb: log file is corrupt")
 // newer btypedb with an incompatible on-disk format. Test with errors.Is.
 var ErrNewerFormat = errors.New("btypedb: log file format is newer than this btypedb supports")
 
+// Encryption sentinels returned by Open when the caller's key does not
+// match the file's state. Test with errors.Is.
+var (
+	// ErrKeyRequired: the file is encrypted but Open was given no key.
+	ErrKeyRequired = errors.New("btypedb: log file is encrypted but no encryption key was supplied")
+	// ErrWrongKey: a key was supplied but does not match the file (its
+	// header key-check value fails). Caught at Open, before any record.
+	ErrWrongKey = errors.New("btypedb: encryption key does not match the database")
+	// ErrNotEncrypted: a key was supplied but the file is plaintext.
+	ErrNotEncrypted = errors.New("btypedb: encryption key supplied but the database is not encrypted")
+	// ErrCipherMismatch: the file's cipher/scope flags disagree with the
+	// supplied configuration.
+	ErrCipherMismatch = errors.New("btypedb: encryption cipher or scope does not match the database")
+)
+
 // SyncPolicy controls when the write-ahead log is fsynced.
 type SyncPolicy int
 
@@ -90,7 +105,8 @@ type options struct {
 	compactGrowthPct  int
 	sweepInterval     time.Duration
 	truncateAtCorrupt bool
-	fs                fsys // test seam; nil = the real filesystem
+	encKey            []byte // nil = plaintext log; 32 bytes = AES-256-GCM at rest
+	fs                fsys   // test seam; nil = the real filesystem
 }
 
 func defaultOptions() options {
@@ -142,12 +158,34 @@ func WithSweepInterval(d time.Duration) Option {
 	return func(o *options) { o.sweepInterval = d }
 }
 
+// WithEncryptionKey encrypts the write-ahead log at rest with AES-256-GCM,
+// keyed by a 32-byte master supplied by the caller (from an env var, a
+// mounted file, a KMS — the engine does not source or persist it). Each
+// record's value is sealed with a fresh random nonce; the key stays
+// cleartext (value-only scope), so ordering and range scans are unaffected
+// and rows remain plaintext in memory. Because replication and backup ship
+// raw log bytes, the object-store replica and backup files become ciphertext
+// too — a follower or restore needs this same key to Open the file.
+//
+// The key must be exactly 32 bytes or Open fails. Opening an encrypted
+// database without the key (or with the wrong key) fails with ErrKeyRequired
+// / ErrWrongKey; passing a key to a plaintext database fails with
+// ErrNotEncrypted. There is no in-place plaintext↔encrypted conversion:
+// migrate by copying rows into a fresh database opened with (or without)
+// this option.
+func WithEncryptionKey(key []byte) Option {
+	// Copy so a caller that zeroes its buffer after Open cannot race the
+	// cipher construction that happens inside Open.
+	return func(o *options) { o.encKey = append([]byte(nil), key...) }
+}
+
 // DB is an embedded key-value store. Keys are kept in sorted order.
 // All methods are safe for concurrent use.
 type DB[K cmp.Ordered, V any] struct {
 	path             string
 	keyCodec         Codec[K]
 	valCodec         Codec[V]
+	cipher           *walCipher // nil = plaintext log; set = AES-256-GCM at rest
 	policy           SyncPolicy
 	autoCompact      bool
 	compactMinSize   int64
@@ -200,6 +238,17 @@ func Open[K cmp.Ordered, V any](path string, keyCodec Codec[K], valCodec Codec[V
 		opt(&o)
 	}
 
+	// Build the record cipher once, up front: the same handle validates the
+	// header, decrypts the replay stream, and seals every later write.
+	var wc *walCipher
+	if o.encKey != nil {
+		c, err := newWalCipher(o.encKey)
+		if err != nil {
+			return nil, serr.Wrap(err, "op", "init encryption")
+		}
+		wc = c
+	}
+
 	fs := o.fs
 	if fs == nil {
 		fs = realFS{}
@@ -220,8 +269,10 @@ func Open[K cmp.Ordered, V any](path string, keyCodec Codec[K], valCodec Codec[V
 
 	// Classify the file by its header: freshly created (write one),
 	// current format (records start after it), legacy pre-header format
-	// (records start at 0), wrong version, or corrupt header.
-	dataStart, err := prepareHeader(f)
+	// (records start at 0), wrong version, or corrupt header. When a key was
+	// supplied this also reconciles it with the file (wrong key / not
+	// encrypted / encrypted-without-key all fail here, before any record).
+	dataStart, err := prepareHeader(f, wc)
 	if err != nil {
 		f.Close()
 		return nil, serr.Wrap(err, "path", path)
@@ -233,23 +284,31 @@ func Open[K cmp.Ordered, V any](path string, keyCodec Codec[K], valCodec Codec[V
 
 	state := newDBState[K, V]()
 	validLen, parsedLen, err := replayLog(f, func(rec walRecord) error {
-		key, err := keyCodec.Decode(rec.key)
+		// Decrypt the value payload before decoding. For a plaintext log (or
+		// an opDelete, which is never sealed) openRecord passes the bytes
+		// through unchanged. A decrypt failure here is past the CRC, so it is
+		// tampering or a mismatched key — a hard error, not a torn tail.
+		keyBytes, valBytes, err := openRecord(wc, rec.op, rec.key, rec.val)
+		if err != nil {
+			return serr.Wrap(err, "decrypting", "record")
+		}
+		key, err := keyCodec.Decode(keyBytes)
 		if err != nil {
 			return serr.Wrap(err, "decoding", "key")
 		}
 		switch rec.op {
 		case opSet:
-			val, err := valCodec.Decode(rec.val)
+			val, err := valCodec.Decode(valBytes)
 			if err != nil {
 				return serr.Wrap(err, "decoding", "value")
 			}
 			state.set(key, val, 0)
 		case opSetTTL:
-			if len(rec.val) < ttlPrefixSize {
+			if len(valBytes) < ttlPrefixSize {
 				return serr.New("malformed ttl record")
 			}
-			deadline := int64(binary.LittleEndian.Uint64(rec.val))
-			val, err := valCodec.Decode(rec.val[ttlPrefixSize:])
+			deadline := int64(binary.LittleEndian.Uint64(valBytes))
+			val, err := valCodec.Decode(valBytes[ttlPrefixSize:])
 			if err != nil {
 				return serr.Wrap(err, "decoding", "value")
 			}
@@ -306,6 +365,7 @@ func Open[K cmp.Ordered, V any](path string, keyCodec Codec[K], valCodec Codec[V
 		path:             path,
 		keyCodec:         keyCodec,
 		valCodec:         valCodec,
+		cipher:           wc,
 		policy:           o.syncPolicy,
 		autoCompact:      o.autoCompact,
 		compactMinSize:   o.compactMinSize,
@@ -670,7 +730,11 @@ func (db *DB[K, V]) releaseState(st *dbState[K, V]) {
 // call, made after the locks are released, so concurrent committers
 // share fsyncs (group commit).
 func (db *DB[K, V]) appendToLog(op byte, key, val []byte) error {
-	db.wbuf = appendRecord(db.wbuf[:0], op, key, val)
+	buf, err := appendSealedRecord(db.wbuf[:0], db.cipher, op, key, val)
+	if err != nil {
+		return serr.Wrap(err, "op", "seal record")
+	}
+	db.wbuf = buf
 	return db.writeLog(db.wbuf)
 }
 
