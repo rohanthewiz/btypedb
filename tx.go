@@ -77,11 +77,29 @@ func (db *DB[K, V]) View(fn func(tx *Tx[K, V]) error) error {
 
 // Update runs fn inside a writable transaction, committing if fn returns
 // nil and rolling back otherwise.
+//
+// Begin(true) takes the single-writer lock (writerMu) and holds it for the
+// transaction's lifetime; the lock is released only by Commit or Rollback.
+// An error RETURN from fn is handled below, but a PANIC would otherwise
+// unwind straight past this function with neither Commit nor Rollback ever
+// running — leaving writerMu held forever and wedging every future write
+// process-wide (reads keep working on their own snapshots, which masks the
+// hang). The deferred recover closes that hole: it rolls back to release
+// the lock, then re-panics so the caller still sees the original failure
+// and its stack. Rollback is idempotent on tx.done, so this is a harmless
+// no-op on the normal commit/return paths and composes safely with any
+// recover a caller layers on top (e.g. bytdb's WriteTxn).
 func (db *DB[K, V]) Update(fn func(tx *Tx[K, V]) error) error {
 	tx, err := db.Begin(true)
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+			panic(r)
+		}
+	}()
 	if err := fn(tx); err != nil {
 		tx.Rollback()
 		return err
