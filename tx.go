@@ -57,6 +57,24 @@ type Tx[K cmp.Ordered, V any] struct {
 	baseVersion uint64
 	ops         []logicalOp[K, V]
 	wranges     []keyRange[K]
+
+	// Read-set bookkeeping for serializable validation (occ mode,
+	// opt-in via TrackReads). The kv layer cannot see semantic reads —
+	// an iterator does not know where its consumer stops, and recording
+	// only the keys actually yielded would miss phantoms (the keys a
+	// scan did NOT see because they were absent). So the layer above,
+	// which knows each read's meaning, records point reads and scan
+	// bounds through MarkRead/MarkReadRange, and Commit validates them
+	// against every intervening commit's writes.
+	trackReads bool
+	readKeys   map[K]struct{}
+	readRanges []keyRange[K]
+
+	// exclusive marks a transaction that must fully serialize (DDL):
+	// its Commit succeeds only if no other commit landed since Begin,
+	// and publishes a wildcard ring entry that conflicts every
+	// overlapping-in-time transaction out. See MarkExclusive.
+	exclusive bool
 }
 
 // Begin starts a transaction. In the default mode a writable
@@ -64,7 +82,16 @@ type Tx[K cmp.Ordered, V any] struct {
 // write completes; in concurrent-writes mode it starts immediately and
 // contention is resolved at Commit instead (ErrTxConflict).
 func (db *DB[K, V]) Begin(writable bool) (*Tx[K, V], error) {
-	takeWriter := writable && !db.occ
+	return db.begin(writable, false)
+}
+
+// begin is Begin with the exclusive escalation UpdateExclusive needs:
+// exclusive takes the writer lock for the transaction's whole lifetime
+// even in concurrent-writes mode, freezing the head so Commit cannot
+// conflict. In default mode exclusive changes nothing — every writable
+// transaction already holds the lock for its lifetime.
+func (db *DB[K, V]) begin(writable, exclusive bool) (*Tx[K, V], error) {
+	takeWriter := writable && (!db.occ || exclusive)
 	if takeWriter {
 		db.writerMu.Lock()
 	}
@@ -85,7 +112,12 @@ func (db *DB[K, V]) Begin(writable bool) (*Tx[K, V], error) {
 	snap := db.state.copy()
 	base := db.commitVersion
 	db.mu.Unlock()
-	return &Tx[K, V]{db: db, state: snap, writable: writable, holdsWriter: takeWriter, baseVersion: base}, nil
+	tx := &Tx[K, V]{db: db, state: snap, writable: writable, holdsWriter: takeWriter, baseVersion: base}
+	// The wildcard publish matters even though the held lock froze the
+	// head: transactions that began before us can still commit after we
+	// release, and they must fail validation against our entry.
+	tx.exclusive = exclusive && db.occ
+	return tx, nil
 }
 
 // View runs fn inside a read-only transaction, releasing the snapshot
@@ -132,6 +164,99 @@ func (db *DB[K, V]) Update(fn func(tx *Tx[K, V]) error) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// UpdateExclusive runs fn inside a writable transaction that fully
+// serializes with every other write, whichever mode the store is in.
+// In concurrent-writes mode it takes the writer lock for the
+// transaction's whole lifetime — no commit can land while fn runs, so
+// the commit can never fail with ErrTxConflict — and publishes a
+// wildcard validation entry, so every transaction that overlapped it
+// in time conflicts and retries. In default mode it is exactly Update.
+//
+// This is the guaranteed-progress escalation for work that must
+// serialize (schema changes): optimism first via MarkExclusive, and
+// when contention keeps winning, one UpdateExclusive run that cannot
+// lose. Keep fn short — every writer in the process waits behind it.
+func (db *DB[K, V]) UpdateExclusive(fn func(tx *Tx[K, V]) error) error {
+	tx, err := db.begin(true, true)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+			panic(r)
+		}
+	}()
+	if err := fn(tx); err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+// TrackReads opts this transaction into serializable validation: point
+// reads and scan bounds subsequently recorded with MarkRead and
+// MarkReadRange are checked at Commit against every commit that landed
+// since Begin — any overlap fails with ErrTxConflict, exactly like a
+// write-write conflict. Only meaningful for writable transactions in
+// concurrent-writes mode; elsewhere it is a no-op (default mode is
+// already serializable, and a read-only snapshot needs no validation).
+//
+// The caller decides what a "read" is; that is the point. Recording a
+// scan as its semantic [min, max) bound is what catches phantoms — the
+// keys the scan did not see — which per-key instrumentation never can.
+// Reads survive savepoint rollback deliberately: results produced
+// before a RollbackTo may already have escaped to the application, so
+// they stay part of what Commit vouches for.
+func (tx *Tx[K, V]) TrackReads() {
+	if tx.done || !tx.writable || !tx.db.occ {
+		return
+	}
+	tx.trackReads = true
+}
+
+// MarkRead records a point read (a Get or existence probe, hit or
+// miss — absence is information too) for serializable validation.
+// A no-op unless the transaction called TrackReads.
+func (tx *Tx[K, V]) MarkRead(key K) {
+	if !tx.trackReads || tx.done {
+		return
+	}
+	if tx.readKeys == nil {
+		tx.readKeys = map[K]struct{}{}
+	}
+	tx.readKeys[key] = struct{}{}
+}
+
+// MarkReadRange records a scan over [min, max) for serializable
+// validation. Record the bounds actually scanned, not the keys seen:
+// the interval claim is what makes a concurrent insert into the gap —
+// a phantom — a conflict. A no-op unless the transaction called
+// TrackReads.
+func (tx *Tx[K, V]) MarkReadRange(min, max K) {
+	if !tx.trackReads || tx.done {
+		return
+	}
+	tx.readRanges = append(tx.readRanges, keyRange[K]{min: min, max: max})
+}
+
+// MarkExclusive declares that this transaction must fully serialize
+// with every other write — the schema-change contract. Its Commit
+// succeeds only if NO other commit landed since Begin (any commit at
+// all fails it with ErrTxConflict, no validation attempted: work like
+// an index backfill depends on every key of its snapshot staying put,
+// which per-key write sets cannot express). When it does publish, its
+// ring entry is a wildcard, so every transaction that overlapped it in
+// time — whatever keys it touched — conflicts and retries against the
+// new schema. A no-op outside concurrent-writes mode, where writers
+// already fully serialize.
+func (tx *Tx[K, V]) MarkExclusive() {
+	if tx.done || !tx.writable || !tx.db.occ {
+		return
+	}
+	tx.exclusive = true
 }
 
 // Commit publishes the transaction's changes: the accumulated records are
@@ -187,11 +312,16 @@ func (tx *Tx[K, V]) Commit() error {
 	}
 
 	if db.occ && db.commitVersion != tx.baseVersion {
-		// The head moved while we executed. Fetch the commits we
-		// missed; failure to fetch (ring evicted part of the span)
-		// counts as a conflict because we can no longer prove safety.
+		// The head moved while we executed. An exclusive transaction
+		// (DDL) gives up immediately — its work assumed a frozen
+		// snapshot. Otherwise fetch the commits we missed and validate
+		// writes, then reads (serializable opt-in); failure to fetch
+		// (ring evicted part of the span) counts as a conflict because
+		// we can no longer prove safety.
 		entries, ok := db.recent.since(tx.baseVersion, db.commitVersion)
-		if !ok || occConflicts(entries, tx.ops, tx.wranges) {
+		if tx.exclusive || !ok ||
+			occConflicts(entries, tx.ops, tx.wranges) ||
+			occReadConflicts(entries, tx.readKeys, tx.readRanges) {
 			tx.state.release()
 			db.mu.Unlock()
 			db.writerMu.Unlock()
@@ -232,7 +362,14 @@ func (tx *Tx[K, V]) Commit() error {
 	db.state = tx.state
 	old.release()
 	if db.occ {
-		db.pushCommit(occEntry(tx.ops, tx.wranges))
+		if tx.exclusive {
+			// A schema change invalidates every overlapping
+			// transaction, not just those touching its keys: they may
+			// have read (or be about to write under) the old schema.
+			db.pushCommit(commitEntry[K]{wildcard: true})
+		} else {
+			db.pushCommit(occEntry(tx.ops, tx.wranges))
+		}
 	}
 	seq := db.appendSeq
 	db.mu.Unlock()

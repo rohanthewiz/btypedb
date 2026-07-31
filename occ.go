@@ -27,6 +27,11 @@ var ErrTxConflict = errors.New("btypedb: transaction conflicts with a concurrent
 // range deletes back TRUNCATE-style operations upstream, and an insert
 // silently surviving one is not acceptable.
 //
+// A transaction can individually upgrade to serializable by recording
+// its reads (TrackReads, MarkRead, MarkReadRange) — Commit then also
+// fails on read-write overlap — or fully serialize with MarkExclusive /
+// UpdateExclusive, the schema-change contract. See those methods.
+//
 // Off by default: without this option writable transactions serialize
 // exactly as before, holding the writer lock from Begin to Commit, and
 // ErrTxConflict is never returned.
@@ -147,6 +152,64 @@ func occEntry[K cmp.Ordered, V any](ops []logicalOp[K, V], wranges []keyRange[K]
 		keys[i] = op.key
 	}
 	return commitEntry[K]{keys: keys, ranges: wranges}
+}
+
+// occReadConflicts reports whether any intervening commit wrote a key
+// or range this transaction read. This is the upgrade from snapshot
+// isolation to serializability (classic backward validation): with
+// write-write overlap already excluded by occConflicts, proving that no
+// intervening commit touched anything we READ means our reads are still
+// true on the current head — so replaying our ops after those commits
+// equals a serial execution in commit order. Committed transactions'
+// reads need no checking in return: they already serialized before us,
+// and nothing they read could have included our unpublished writes.
+//
+// The read set only exists when the layer above opted in via TrackReads
+// and recorded its semantic reads (point looks, scan bounds); an empty
+// read set keeps plain snapshot-isolation behavior at zero cost.
+func occReadConflicts[K cmp.Ordered](entries []commitEntry[K], readKeys map[K]struct{}, readRanges []keyRange[K]) bool {
+	if len(readKeys) == 0 && len(readRanges) == 0 {
+		return false
+	}
+	inReadRanges := func(k K) bool {
+		for _, r := range readRanges {
+			if k >= r.min && k < r.max {
+				return true
+			}
+		}
+		return false
+	}
+	for _, e := range entries {
+		if e.wildcard {
+			return true
+		}
+		for _, k := range e.keys {
+			if _, hit := readKeys[k]; hit {
+				return true
+			}
+			// A key they wrote inside a range we scanned is a phantom:
+			// re-running our scan on the current head would see it.
+			if inReadRanges(k) {
+				return true
+			}
+		}
+		for _, r := range e.ranges {
+			// Their range delete may have removed keys we point-read or
+			// keys inside our scan bounds — either way our reads are
+			// stale on the current head.
+			for k := range readKeys {
+				if k >= r.min && k < r.max {
+					return true
+				}
+			}
+			for _, or := range readRanges {
+				if or.min < r.max && r.min < or.max {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // occConflicts reports whether any intervening commit overlaps this
