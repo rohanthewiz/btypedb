@@ -23,7 +23,11 @@ func (db *DB[K, V]) sweepLoop() {
 		case <-db.stopSweep:
 			return
 		case <-ticker.C:
-			if err := db.sweepExpired(); err != nil && !errors.Is(err, ErrClosed) {
+			// ErrTxConflict (concurrent-writes mode): a user commit
+			// touched an expired key between our scan and our commit.
+			// Not a fault — the keys are still expired and the next
+			// tick sweeps them.
+			if err := db.sweepExpired(); err != nil && !errors.Is(err, ErrClosed) && !errors.Is(err, ErrTxConflict) {
 				db.mu.Lock()
 				if db.sweepErr == nil {
 					db.sweepErr = serr.Wrap(err, "op", "expiry sweep")

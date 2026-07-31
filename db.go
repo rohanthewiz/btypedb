@@ -105,6 +105,7 @@ type options struct {
 	compactGrowthPct  int
 	sweepInterval     time.Duration
 	truncateAtCorrupt bool
+	concurrentWrites  bool   // OCC mode: writer lock held only at commit; see WithConcurrentWrites
 	encKey            []byte // nil = plaintext log; 32 bytes = AES-256-GCM at rest
 	fs                fsys   // test seam; nil = the real filesystem
 }
@@ -194,7 +195,17 @@ type DB[K cmp.Ordered, V any] struct {
 
 	// writerMu serializes writable transactions and direct writes with
 	// each other. Lock order: writerMu before mu, always.
+	//
+	// Its scope depends on the mode. Default: taken at Begin(true) and
+	// held for the transaction's whole lifetime, so writers fully
+	// serialize. Concurrent-writes mode (occ): taken only inside Commit
+	// around validate → WAL append → pointer swap, so transactions
+	// execute concurrently and serialize only while publishing.
 	writerMu sync.Mutex
+
+	// occ enables optimistic concurrency control for writable
+	// transactions (WithConcurrentWrites). Immutable after Open.
+	occ bool
 
 	// compactMu allows only one compaction at a time. It is never held
 	// together with writerMu; it nests outside mu like writerMu does.
@@ -202,6 +213,12 @@ type DB[K cmp.Ordered, V any] struct {
 
 	mu         sync.RWMutex
 	state      *dbState[K, V]
+	// commitVersion counts publishing commits; recent retains the
+	// changed-key summaries of the last occRingCap of them so an OCC
+	// committer can validate its snapshot's staleness (see occ.go).
+	// Both are guarded by mu and maintained only in occ mode.
+	commitVersion uint64
+	recent        commitRing[K]
 	file       logfile
 	fs         fsys   // filesystem ops (real, or a fault-injecting test double)
 	wbuf       []byte // reusable record-encoding buffer, guarded by mu
@@ -368,6 +385,7 @@ func Open[K cmp.Ordered, V any](path string, keyCodec Codec[K], valCodec Codec[V
 		cipher:           wc,
 		policy:           o.syncPolicy,
 		autoCompact:      o.autoCompact,
+		occ:              o.concurrentWrites,
 		compactMinSize:   o.compactMinSize,
 		compactGrowthPct: o.compactGrowthPct,
 		sweepInterval:    o.sweepInterval,
@@ -431,6 +449,12 @@ func (db *DB[K, V]) setInternal(key K, value V, deadline int64) error {
 	}
 	if err == nil {
 		db.state.set(key, value, deadline)
+		if db.occ {
+			// A direct write is a one-key commit: open OCC
+			// transactions must see it in the validation ring or a
+			// conflicting Commit would replay over it silently.
+			db.pushCommit(commitEntry[K]{keys: []K{key}})
+		}
 	}
 	seq := db.appendSeq
 	db.mu.Unlock()
@@ -479,6 +503,9 @@ func (db *DB[K, V]) Delete(key K) (existed bool, err error) {
 	}
 	if err == nil {
 		db.state.delete(key)
+		if db.occ {
+			db.pushCommit(commitEntry[K]{keys: []K{key}})
+		}
 	}
 	seq := db.appendSeq
 	db.mu.Unlock()

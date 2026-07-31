@@ -22,9 +22,14 @@ var ErrTxNotWritable = errors.New("btypedb: transaction is read-only")
 // A read-only transaction sees the database exactly as it was at Begin,
 // no matter what commits afterward, and reads without taking any locks.
 // A writable transaction works on a private copy — its changes are
-// invisible to others until Commit atomically publishes them — and holds
-// the single-writer lock for its lifetime, so writable transactions
-// serialize with each other and with direct DB.Set/Delete calls.
+// invisible to others until Commit atomically publishes them.
+//
+// How writable transactions coordinate depends on the mode. Default:
+// Begin takes the single-writer lock and holds it until Commit or
+// Rollback, so writers fully serialize with each other and with direct
+// DB.Set/Delete calls. Concurrent-writes mode (WithConcurrentWrites):
+// writers execute lock-free and only Commit serializes, validating the
+// write set against commits that landed since Begin — see occ.go.
 //
 // Every transaction must be finished with Commit or Rollback to release
 // its snapshot. A Tx is not safe for concurrent use by multiple
@@ -37,12 +42,30 @@ type Tx[K cmp.Ordered, V any] struct {
 	nops     uint64
 	saves    []*Savepoint[K, V] // outstanding savepoints, oldest first
 	done     bool
+
+	// holdsWriter tracks writerMu ownership so Commit and Rollback
+	// release exactly what was taken: the whole-lifetime lock from
+	// Begin (default mode) or nothing yet (occ mode, where Commit
+	// takes it itself). A flag, not a mode check, so the unlock sites
+	// cannot drift from the lock sites.
+	holdsWriter bool
+
+	// OCC bookkeeping (occ mode only; unused otherwise). ops mirrors
+	// pending as decoded, replayable writes; wranges holds the [min,
+	// max) claims of DeleteRange calls; baseVersion is the head's
+	// commitVersion at Begin, against which Commit validates.
+	baseVersion uint64
+	ops         []logicalOp[K, V]
+	wranges     []keyRange[K]
 }
 
-// Begin starts a transaction. A writable transaction blocks until any
-// in-flight writable transaction or direct write completes.
+// Begin starts a transaction. In the default mode a writable
+// transaction blocks until any in-flight writable transaction or direct
+// write completes; in concurrent-writes mode it starts immediately and
+// contention is resolved at Commit instead (ErrTxConflict).
 func (db *DB[K, V]) Begin(writable bool) (*Tx[K, V], error) {
-	if writable {
+	takeWriter := writable && !db.occ
+	if takeWriter {
 		db.writerMu.Lock()
 	}
 	db.mu.Lock()
@@ -54,14 +77,15 @@ func (db *DB[K, V]) Begin(writable bool) (*Tx[K, V], error) {
 	}
 	if err != nil {
 		db.mu.Unlock()
-		if writable {
+		if takeWriter {
 			db.writerMu.Unlock()
 		}
 		return nil, err
 	}
 	snap := db.state.copy()
+	base := db.commitVersion
 	db.mu.Unlock()
-	return &Tx[K, V]{db: db, state: snap, writable: writable}, nil
+	return &Tx[K, V]{db: db, state: snap, writable: writable, holdsWriter: takeWriter, baseVersion: base}, nil
 }
 
 // View runs fn inside a read-only transaction, releasing the snapshot
@@ -78,17 +102,20 @@ func (db *DB[K, V]) View(fn func(tx *Tx[K, V]) error) error {
 // Update runs fn inside a writable transaction, committing if fn returns
 // nil and rolling back otherwise.
 //
-// Begin(true) takes the single-writer lock (writerMu) and holds it for the
-// transaction's lifetime; the lock is released only by Commit or Rollback.
-// An error RETURN from fn is handled below, but a PANIC would otherwise
-// unwind straight past this function with neither Commit nor Rollback ever
-// running — leaving writerMu held forever and wedging every future write
-// process-wide (reads keep working on their own snapshots, which masks the
-// hang). The deferred recover closes that hole: it rolls back to release
-// the lock, then re-panics so the caller still sees the original failure
-// and its stack. Rollback is idempotent on tx.done, so this is a harmless
-// no-op on the normal commit/return paths and composes safely with any
-// recover a caller layers on top (e.g. bytdb's WriteTxn).
+// In the default mode Begin(true) takes the single-writer lock (writerMu)
+// and holds it for the transaction's lifetime; the lock is released only
+// by Commit or Rollback. An error RETURN from fn is handled below, but a
+// PANIC would otherwise unwind straight past this function with neither
+// Commit nor Rollback ever running — leaving writerMu held forever and
+// wedging every future write process-wide (reads keep working on their
+// own snapshots, which masks the hang). The deferred recover closes that
+// hole: it rolls back to release the lock, then re-panics so the caller
+// still sees the original failure and its stack. In concurrent-writes
+// mode no lock is held across fn, but the recover still matters — it
+// releases the snapshot's COW pins. Rollback is idempotent on tx.done,
+// so this is a harmless no-op on the normal commit/return paths and
+// composes safely with any recover a caller layers on top (e.g. bytdb's
+// WriteTxn).
 func (db *DB[K, V]) Update(fn func(tx *Tx[K, V]) error) error {
 	tx, err := db.Begin(true)
 	if err != nil {
@@ -112,6 +139,16 @@ func (db *DB[K, V]) Update(fn func(tx *Tx[K, V]) error) error {
 // atomic batch), fsynced per policy, and the snapshot becomes the live
 // state in a single pointer swap. Committing a read-only or empty
 // transaction just releases the snapshot.
+//
+// In concurrent-writes mode this is where contention resolves. The
+// writer lock is taken here (not at Begin) and held only across
+// validate → append → swap. If the head moved since Begin, the write
+// set is checked against every intervening commit: any overlap fails
+// with ErrTxConflict, no overlap replays the buffered ops onto a copy
+// of the current head — validation proved the ops commute, so the
+// result equals a serial execution after the commits that beat us. The
+// WAL append happens inside the lock either way, so the log stays in
+// commit order and replay, backup, and replication are unaffected.
 func (tx *Tx[K, V]) Commit() error {
 	if tx.done {
 		return ErrTxClosed
@@ -127,6 +164,12 @@ func (tx *Tx[K, V]) Commit() error {
 		return nil
 	}
 
+	if !tx.holdsWriter {
+		// occ mode: the commit-scoped writer lock. holdsWriter keeps
+		// the release paths below identical for both modes.
+		db.writerMu.Lock()
+		tx.holdsWriter = true
+	}
 	db.mu.Lock()
 	tx.releaseSaves()
 	err := db.canWrite()
@@ -135,6 +178,32 @@ func (tx *Tx[K, V]) Commit() error {
 		db.mu.Unlock()
 		db.writerMu.Unlock()
 		return err
+	}
+
+	if db.occ && db.commitVersion != tx.baseVersion {
+		// The head moved while we executed. Fetch the commits we
+		// missed; failure to fetch (ring evicted part of the span)
+		// counts as a conflict because we can no longer prove safety.
+		entries, ok := db.recent.since(tx.baseVersion, db.commitVersion)
+		if !ok || occConflicts(entries, tx.ops, tx.wranges) {
+			tx.state.release()
+			db.mu.Unlock()
+			db.writerMu.Unlock()
+			return ErrTxConflict
+		}
+		// Disjoint: replay our ops onto the current head. tx.state was
+		// built from a stale base and would lose the intervening
+		// commits if swapped in, so it is discarded, not merged.
+		merged := db.state.copy()
+		for _, op := range tx.ops {
+			if op.del {
+				merged.delete(op.key)
+			} else {
+				merged.set(op.key, op.val, op.deadline)
+			}
+		}
+		tx.state.release()
+		tx.state = merged
 	}
 
 	// A single op replays atomically on its own; a multi-op tx gets a
@@ -156,6 +225,9 @@ func (tx *Tx[K, V]) Commit() error {
 	old := db.state
 	db.state = tx.state
 	old.release()
+	if db.occ {
+		db.pushCommit(occEntry(tx.ops, tx.wranges))
+	}
 	seq := db.appendSeq
 	db.mu.Unlock()
 	db.writerMu.Unlock()
@@ -175,7 +247,9 @@ func (tx *Tx[K, V]) Rollback() error {
 	tx.releaseSaves()
 	tx.state.release()
 	tx.db.mu.Unlock()
-	if tx.writable {
+	// holdsWriter, not writable: an occ-mode writable transaction never
+	// took writerMu (Commit takes and releases it itself).
+	if tx.holdsWriter {
 		tx.db.writerMu.Unlock()
 	}
 	return nil
@@ -222,6 +296,12 @@ func (tx *Tx[K, V]) setInternal(key K, value V, deadline int64) error {
 	}
 	tx.nops++
 	tx.state.set(key, value, deadline)
+	if tx.db.occ {
+		// Mirror the write as a decoded, replayable op: pending holds
+		// sealed WAL bytes, which cannot be re-applied to trees if the
+		// commit has to replay onto a moved head.
+		tx.ops = append(tx.ops, logicalOp[K, V]{key: key, val: value, deadline: deadline})
+	}
 	return nil
 }
 
@@ -245,6 +325,9 @@ func (tx *Tx[K, V]) Delete(key K) (existed bool, err error) {
 	tx.pending = appendRecord(tx.pending, opDelete, kb, nil)
 	tx.nops++
 	tx.state.delete(key)
+	if tx.db.occ {
+		tx.ops = append(tx.ops, logicalOp[K, V]{del: true, key: key})
+	}
 	return visible, nil
 }
 
@@ -284,6 +367,18 @@ func (tx *Tx[K, V]) DeleteRange(min, max K) (int, error) {
 		tx.pending = appendRecord(tx.pending, opDelete, encoded[i], nil)
 		tx.nops++
 		tx.state.delete(k)
+		if tx.db.occ {
+			tx.ops = append(tx.ops, logicalOp[K, V]{del: true, key: k})
+		}
+	}
+	if tx.db.occ {
+		// Claim the whole interval, not just the keys the snapshot
+		// held: a key another transaction inserts into [min, max)
+		// concurrently must conflict, or it would silently survive a
+		// range delete that logically covers it (the TRUNCATE case).
+		// Claimed even when the range was empty — a later write in
+		// this tx still publishes the entry.
+		tx.wranges = append(tx.wranges, keyRange[K]{min: min, max: max})
 	}
 	return visible, nil
 }

@@ -19,6 +19,8 @@ type Savepoint[K cmp.Ordered, V any] struct {
 	state      *dbState[K, V] // COW snapshot of the tx state at the mark
 	pendingLen int            // tx.pending length at the mark
 	nops       uint64
+	opsLen     int // tx.ops length at the mark (occ mode; 0 otherwise)
+	wrangesLen int // tx.wranges length at the mark (occ mode; 0 otherwise)
 	active     bool
 }
 
@@ -35,7 +37,14 @@ func (tx *Tx[K, V]) Savepoint() (*Savepoint[K, V], error) {
 	tx.db.mu.Lock()
 	st := tx.state.copy()
 	tx.db.mu.Unlock()
-	sp := &Savepoint[K, V]{state: st, pendingLen: len(tx.pending), nops: tx.nops, active: true}
+	sp := &Savepoint[K, V]{
+		state:      st,
+		pendingLen: len(tx.pending),
+		nops:       tx.nops,
+		opsLen:     len(tx.ops),
+		wrangesLen: len(tx.wranges),
+		active:     true,
+	}
 	tx.saves = append(tx.saves, sp)
 	return sp, nil
 }
@@ -60,6 +69,12 @@ func (tx *Tx[K, V]) RollbackTo(sp *Savepoint[K, V]) error {
 	tx.saves = tx.saves[:i+1]
 	tx.pending = tx.pending[:sp.pendingLen]
 	tx.nops = sp.nops
+	// The OCC write set shrinks in lockstep with pending: replay and
+	// conflict validation must cover exactly the surviving writes —
+	// a rolled-back op that lingered here would cause both spurious
+	// conflicts and, worse, replay of a write the WAL never logged.
+	tx.ops = tx.ops[:sp.opsLen]
+	tx.wranges = tx.wranges[:sp.wrangesLen]
 	return nil
 }
 
