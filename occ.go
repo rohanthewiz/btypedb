@@ -34,6 +34,12 @@ func WithConcurrentWrites() Option {
 	return func(o *options) { o.concurrentWrites = true }
 }
 
+// ConcurrentWrites reports whether the store was opened with
+// WithConcurrentWrites. Layers above use it to pick strategies that only
+// make sense under OCC — e.g. moving hot counters out of transactional
+// write sets so they stop manufacturing write-write conflicts.
+func (db *DB[K, V]) ConcurrentWrites() bool { return db.occ }
+
 const (
 	// occRingCap bounds how many recent commits keep their changed-key
 	// sets for validation. A committer whose snapshot predates the

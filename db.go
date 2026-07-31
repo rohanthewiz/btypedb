@@ -211,27 +211,27 @@ type DB[K cmp.Ordered, V any] struct {
 	// together with writerMu; it nests outside mu like writerMu does.
 	compactMu sync.Mutex
 
-	mu         sync.RWMutex
-	state      *dbState[K, V]
+	mu    sync.RWMutex
+	state *dbState[K, V]
 	// commitVersion counts publishing commits; recent retains the
 	// changed-key summaries of the last occRingCap of them so an OCC
 	// committer can validate its snapshot's staleness (see occ.go).
 	// Both are guarded by mu and maintained only in occ mode.
 	commitVersion uint64
 	recent        commitRing[K]
-	file       logfile
-	fs         fsys   // filesystem ops (real, or a fault-injecting test double)
-	wbuf       []byte // reusable record-encoding buffer, guarded by mu
-	walSize    int64  // bytes of valid log on disk
-	baseSize   int64  // log size just after the last compaction (or open)
-	fileEpoch  uint64 // bumped each time the log file is swapped (compaction); see replication.go
-	appendSeq  uint64 // count of log appends; the group-commit watermark unit
-	closed     bool
-	compacting bool  // an auto-compaction goroutine is in flight
-	writeErr   error // sticky: after a failed log append the DB refuses writes
-	syncErr    error // last error from the background syncer, surfaced on Close
-	compactErr error // last error from auto-compaction, surfaced on Close
-	sweepErr   error // last error from the expiry sweeper, surfaced on Close
+	file          logfile
+	fs            fsys   // filesystem ops (real, or a fault-injecting test double)
+	wbuf          []byte // reusable record-encoding buffer, guarded by mu
+	walSize       int64  // bytes of valid log on disk
+	baseSize      int64  // log size just after the last compaction (or open)
+	fileEpoch     uint64 // bumped each time the log file is swapped (compaction); see replication.go
+	appendSeq     uint64 // count of log appends; the group-commit watermark unit
+	closed        bool
+	compacting    bool  // an auto-compaction goroutine is in flight
+	writeErr      error // sticky: after a failed log append the DB refuses writes
+	syncErr       error // last error from the background syncer, surfaced on Close
+	compactErr    error // last error from auto-compaction, surfaced on Close
+	sweepErr      error // last error from the expiry sweeper, surfaced on Close
 
 	// gsync coalesces SyncAlways fsyncs across concurrent committers
 	// (group commit). It has its own lock, taken after mu when both are

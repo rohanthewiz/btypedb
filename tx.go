@@ -149,6 +149,12 @@ func (db *DB[K, V]) Update(fn func(tx *Tx[K, V]) error) error {
 // result equals a serial execution after the commits that beat us. The
 // WAL append happens inside the lock either way, so the log stays in
 // commit order and replay, backup, and replication are unaffected.
+// Writable reports whether the transaction accepts writes — the same
+// property that decides ErrTxNotWritable. Exposed for layers that route
+// around the transaction (e.g. non-transactional sequence allocation)
+// and must apply the same read-only guard themselves.
+func (tx *Tx[K, V]) Writable() bool { return tx.writable }
+
 func (tx *Tx[K, V]) Commit() error {
 	if tx.done {
 		return ErrTxClosed
