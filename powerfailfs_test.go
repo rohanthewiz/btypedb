@@ -90,6 +90,10 @@ func (fs *powerFS) cutList() []fsCut {
 	return append([]fsCut(nil), fs.cuts...)
 }
 
+// Lock is a no-op: powerFS paths are virtual, and each test drives a
+// single DB per path, reopening only after the simulated crash.
+func (fs *powerFS) Lock(string) (io.Closer, error) { return nopLock{}, nil }
+
 func (fs *powerFS) OpenFile(path string) (logfile, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()

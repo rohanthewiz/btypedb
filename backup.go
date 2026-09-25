@@ -56,7 +56,20 @@ func (db *DB[K, V]) BackupTo(w io.Writer) (int64, error) {
 // holds a complete backup or whatever it held before. See BackupTo for
 // the consistency and concurrency guarantees. Restoring is just opening
 // the backup file with Open.
+//
+// Backup refuses with ErrLocked when destPath is a live database — this
+// DB's own path, or one another DB holds open. Renaming the copy over a
+// live file would strand its holder on the unlinked old inode, so every
+// write it made afterwards would be lost at its next open. The lock on
+// destPath is held until the copy is in place, which also keeps a DB
+// from opening destPath mid-backup and being swapped out from under.
 func (db *DB[K, V]) Backup(destPath string) error {
+	lock, err := db.fs.Lock(destPath)
+	if err != nil {
+		return serr.Wrap(err, "op", "backup")
+	}
+	defer lock.Close()
+
 	tmpPath := destPath + backupSuffix
 	tmp, err := db.fs.Create(tmpPath)
 	if err != nil {

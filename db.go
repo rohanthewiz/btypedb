@@ -220,12 +220,13 @@ type DB[K cmp.Ordered, V any] struct {
 	commitVersion uint64
 	recent        commitRing[K]
 	file          logfile
-	fs            fsys   // filesystem ops (real, or a fault-injecting test double)
-	wbuf          []byte // reusable record-encoding buffer, guarded by mu
-	walSize       int64  // bytes of valid log on disk
-	baseSize      int64  // log size just after the last compaction (or open)
-	fileEpoch     uint64 // bumped each time the log file is swapped (compaction); see replication.go
-	appendSeq     uint64 // count of log appends; the group-commit watermark unit
+	fs            fsys      // filesystem ops (real, or a fault-injecting test double)
+	lock          io.Closer // exclusive lock on the path's sidecar, held from Open to Close; see lock.go
+	wbuf          []byte    // reusable record-encoding buffer, guarded by mu
+	walSize       int64     // bytes of valid log on disk
+	baseSize      int64     // log size just after the last compaction (or open)
+	fileEpoch     uint64    // bumped each time the log file is swapped (compaction); see replication.go
+	appendSeq     uint64    // count of log appends; the group-commit watermark unit
 	closed        bool
 	compacting    bool  // an auto-compaction goroutine is in flight
 	writeErr      error // sticky: after a failed log append the DB refuses writes
@@ -249,7 +250,7 @@ type DB[K cmp.Ordered, V any] struct {
 // replays its log into memory. A torn record at the tail — the normal
 // result of a crash mid-write — is truncated away; valid data before it
 // is preserved.
-func Open[K cmp.Ordered, V any](path string, keyCodec Codec[K], valCodec Codec[V], opts ...Option) (*DB[K, V], error) {
+func Open[K cmp.Ordered, V any](path string, keyCodec Codec[K], valCodec Codec[V], opts ...Option) (_ *DB[K, V], err error) {
 	o := defaultOptions()
 	for _, opt := range opts {
 		opt(&o)
@@ -270,6 +271,23 @@ func Open[K cmp.Ordered, V any](path string, keyCodec Codec[K], valCodec Codec[V
 	if fs == nil {
 		fs = realFS{}
 	}
+
+	// Lock before touching the file, because the rest of Open is not
+	// read-only even when it succeeds: the next line deletes a leftover
+	// compaction temp file (which, with another DB live on this path, is
+	// that DB's in-flight compaction), and replay may truncate what it
+	// takes for a torn tail (which may be the other DB's half-written
+	// append). The lock is released on every failed return below via the
+	// named err, and otherwise held until Close.
+	lock, err := fs.Lock(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			lock.Close()
+		}
+	}()
 
 	// A leftover temp file means a compaction died before its atomic
 	// rename; it was never live, so discard it.
@@ -392,6 +410,7 @@ func Open[K cmp.Ordered, V any](path string, keyCodec Codec[K], valCodec Codec[V
 		state:            state,
 		file:             f,
 		fs:               fs,
+		lock:             lock,
 		walSize:          validLen,
 		baseSize:         validLen,
 	}
@@ -729,6 +748,12 @@ func (db *DB[K, V]) Close() error {
 	}
 	if err := db.file.Close(); err != nil {
 		errs = append(errs, serr.Wrap(err, "op", "close file"))
+	}
+	// Unlock last: until the final sync and close above return, the
+	// file still belongs to this DB, and unlocking first would let a new
+	// DB replay a log that is still being written.
+	if err := db.lock.Close(); err != nil {
+		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
 }

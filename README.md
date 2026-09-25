@@ -167,6 +167,38 @@ splice in ops committed during streaming before an atomic rename swaps
 the compacted file in. A crash at any point leaves either the old or the
 new complete log — a leftover `.compact` temp file is discarded on open.
 
+### One DB per file, enforced
+
+Open takes an exclusive lock on a `<path>.lock` sidecar and holds it
+until Close; a second Open of the same file — from another process, or
+from this one without a Close — fails fast with `ErrLocked`, carrying
+the holder's PID:
+
+```go
+db2, err := btypedb.Open(path, kc, vc)
+if errors.Is(err, btypedb.ErrLocked) {
+	// another DB owns path; share that one instead
+}
+```
+
+Two DBs on one file would each replay the log and append to it
+independently, each blind to the other's writes. The lock lives on a
+sidecar because compaction renames a fresh file over the path, which
+would strand a lock held on the database file's old inode. The sidecar
+stays on disk after Close (deleting it would race a concurrent opener);
+the OS drops the lock itself when the holder exits, so a crash leaves
+no stale lock behind.
+
+`Backup` takes the same lock on its destination, so it refuses to rename
+a copy over a live database (its own path included) — that would leave
+the holder appending to an unlinked file. Code that writes a database
+file without opening it, such as a restore tool, can take the lock
+with `AcquireLock(path)` and close it once the file is in place.
+
+The lock is advisory (`flock` on Unix, a share-mode handle on Windows,
+none on platforms without either): it excludes other lock takers, not
+plain file writes, and older NFS mounts may not honor it.
+
 ## Log format
 
 Single append-only file of framed records:

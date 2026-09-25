@@ -1,15 +1,23 @@
 package btypedb
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 )
 
 // fsys abstracts the filesystem operations the log lifecycle needs —
-// opening the log, and the temp-file/rename dance of compaction — so
-// tests can inject power-loss faults into any of them. realFS is the
-// production implementation.
+// locking and opening the log, and the temp-file/rename dance of
+// compaction — so tests can inject power-loss faults into any of them.
+// realFS is the production implementation.
+//
+// Lock is on the interface, rather than always hitting the OS, because
+// a test double's paths may be purely virtual (powerFS keeps its files
+// in a map), and a sidecar created beside them would land in whatever
+// directory the test happens to run in.
 type fsys interface {
+	Lock(path string) (io.Closer, error) // take the exclusive lock guarding the database at path
+
 	OpenFile(path string) (logfile, error) // open the log, creating it if absent
 	Create(path string) (logfile, error)   // create or truncate a compaction temp file
 	Rename(oldpath, newpath string) error
@@ -18,6 +26,8 @@ type fsys interface {
 }
 
 type realFS struct{}
+
+func (realFS) Lock(path string) (io.Closer, error) { return acquireFileLock(path) }
 
 func (realFS) OpenFile(path string) (logfile, error) {
 	return os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
