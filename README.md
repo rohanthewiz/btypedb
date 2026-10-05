@@ -163,9 +163,13 @@ err = db.Compact()                                             // on demand
 ```
 
 Writers pause only twice, briefly: to take the O(1) snapshot, and to
-splice in ops committed during streaming before an atomic rename swaps
-the compacted file in. A crash at any point leaves either the old or the
-new complete log — a leftover `.compact` temp file is discarded on open.
+splice in the last ops committed during the rewrite before an atomic
+rename swaps the compacted file in. The second pause doesn't grow with
+the database: the snapshot, and the ops that piled up while it
+streamed, are copied and fsynced before writers are paused, so the lock
+covers only a small residue (at most ~1 MB unless writers outrun the
+disk). A crash at any point leaves either the old or the new complete
+log — a leftover `.compact` temp file is discarded on open.
 
 ### One DB per file, enforced
 
