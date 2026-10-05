@@ -189,6 +189,42 @@ func (db *DB[K, V]) Compact() error {
 	return nil
 }
 
+// LogStats describes the log file: where it stands and how far it has
+// grown since the last compaction.
+type LogStats struct {
+	// Epoch and Size are what LogState reports: the file generation
+	// (bumped by every compaction) and the bytes of fully appended
+	// records.
+	Epoch uint64
+	Size  int64
+
+	// BaseSize is what auto-compaction measures growth from: the log's
+	// size right after the last compaction, or at Open if none has run
+	// since. Size - BaseSize is that growth. Right after a compaction it
+	// approximates the live dataset, so the growth is mostly garbage on
+	// an update-heavy workload. At Open, BaseSize is the whole file,
+	// including any garbage it already held, so the growth understates
+	// what a compaction would reclaim until the first one runs.
+	//
+	// Appends that commit while a compaction is catching up on its tail
+	// land in the new file but count as growth, not base (see Compact),
+	// so Size - BaseSize can be positive the moment a compaction ends.
+	BaseSize int64
+}
+
+// LogStats returns the log's epoch, size and auto-compaction base, read
+// together under one lock so they describe the same file: a compaction
+// between separate reads could pair a new, smaller base with the old
+// file's size.
+func (db *DB[K, V]) LogStats() (LogStats, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return LogStats{}, ErrClosed
+	}
+	return LogStats{Epoch: db.fileEpoch, Size: db.walSize, BaseSize: db.baseSize}, nil
+}
+
 // The catch-up loop in Compact stops once phase B would have at most
 // compactCatchUpSlack bytes of tail left to splice under the lock, or
 // after compactCatchUpRounds rounds. A MiB copies and fsyncs in a few

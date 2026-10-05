@@ -160,6 +160,7 @@ the last compaction:
 btypedb.Open(path, kc, vc, btypedb.WithAutoCompact(8<<20, 50)) // ≥8MB, +50% growth
 btypedb.Open(path, kc, vc, btypedb.WithAutoCompactDisabled())  // manual only
 err = db.Compact()                                             // on demand
+ls, err := db.LogStats() // ls.Size - ls.BaseSize: growth since the last compaction (or Open)
 ```
 
 Writers pause only twice, briefly: to take the O(1) snapshot, and to

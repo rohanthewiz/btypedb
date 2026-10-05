@@ -399,3 +399,64 @@ func TestCompactSyncsSnapshotBeforePausingWriters(t *testing.T) {
 		})
 	}
 }
+
+// TestLogStats checks the base auto-compaction measures from: the whole
+// file at Open, unchanged by growth, and reset by a compaction to (about)
+// the live dataset.
+func TestLogStats(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	db := openStr(t, path, WithSyncPolicy(SyncNever), WithAutoCompactDisabled())
+	for round := range 4 {
+		for i := range 100 {
+			if err := db.Set(fmt.Sprintf("k%03d", i), fmt.Sprintf("v%d", round)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db = openStr(t, path, WithSyncPolicy(SyncNever), WithAutoCompactDisabled())
+	open, err := db.LogStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if open.BaseSize != open.Size {
+		t.Fatalf("at Open: base %d, size %d; want the whole file as base", open.BaseSize, open.Size)
+	}
+	if err := db.Set("extra", "v"); err != nil {
+		t.Fatal(err)
+	}
+	grown, err := db.LogStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if grown.BaseSize != open.BaseSize || grown.Size <= open.Size {
+		t.Fatalf("after a write: %+v; want the base unchanged and the size grown from %+v", grown, open)
+	}
+
+	if err := db.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	after, err := db.LogStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Epoch != grown.Epoch+1 {
+		t.Fatalf("epoch after compaction = %d; want %d", after.Epoch, grown.Epoch+1)
+	}
+	if after.BaseSize != after.Size {
+		t.Fatalf("after compaction with no writers: base %d, size %d; want equal", after.BaseSize, after.Size)
+	}
+	if after.Size >= grown.Size/2 {
+		t.Fatalf("compaction left %d of %d bytes; want under half (3 of 4 rounds were garbage)", after.Size, grown.Size)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.LogStats(); err != ErrClosed {
+		t.Fatalf("LogStats on a closed DB = %v; want ErrClosed", err)
+	}
+}
