@@ -1,0 +1,87 @@
+# Continuous integration for btypedb (bytdb deep-look plan D-03).
+#
+# btypedb is a single module with no sibling dependencies, so unlike
+# bytdb there is no workspace to adjust: every job builds the checkout
+# as-is against the versions go.mod pins.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Nightly fuzzing only; the other jobs skip scheduled runs.
+    - cron: "41 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: vet
+        run: go vet ./...
+      - name: test -race
+        run: go test -race -count=1 ./...
+      # One iteration each: a smoke test that the benchmarks still build
+      # and run. Timings on shared runners are too noisy to gate on.
+      - name: benchmark smoke
+        run: go test -run='^$' -bench=. -benchtime=1x ./...
+
+  lint:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          out=$(gofmt -l $(git ls-files '*.go'))
+          if [ -n "$out" ]; then
+            echo "gofmt needed on:"; echo "$out"; exit 1
+          fi
+      - name: staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@v0.8.2
+          staticcheck ./...
+
+  fuzz:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [FuzzOpenRecord, FuzzOpenEncryptedFile]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: fuzz ${{ matrix.target }} for 60s
+        run: go test -run='^$' -fuzz='^${{ matrix.target }}$' -fuzztime=60s .
+      # A failing input lands under testdata/fuzz/<target>/; ship it so it
+      # can be committed as a permanent seed once the bug is fixed.
+      - name: upload new corpus entries
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: testdata/fuzz/${{ matrix.target }}/
+          if-no-files-found: ignore
