@@ -117,6 +117,22 @@ func (s *dbState[K, V]) set(k K, v V, deadline int64) {
 	}
 }
 
+// replaySet is set for log replay. A compacted log holds one record per
+// key in key order, so most keys replayed are above every key so far:
+// PushBack appends those at the tree's right edge, splitting as Set
+// would, without the search at every level that Set spends finding the
+// position it already knows (bytdb deep-look D-48). A key that is not
+// above the last (a later write to an existing key, an uncompacted
+// tail) falls back to set. The fast path needs nothing else to update:
+// a key above every stored key cannot be in the TTL mirror, and indexes
+// are only defined after Open, once replay is done.
+func (s *dbState[K, V]) replaySet(k K, v V, deadline int64) {
+	if deadline == 0 && len(s.idx) == 0 && s.data.PushBack(k, v) {
+		return
+	}
+	s.set(k, v, deadline)
+}
+
 // delete physically removes a pair from every tree, reporting whether it
 // was present at all (expired entries included).
 func (s *dbState[K, V]) delete(k K) (prev V, present bool) {

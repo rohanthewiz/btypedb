@@ -368,7 +368,7 @@ func walkRecords(t *testing.T, raw []byte) []walRecord {
 	br := bufio.NewReader(bytes.NewReader(raw[start:]))
 	var recs []walRecord
 	for {
-		rec, _, ok, err := readRecord(br)
+		rec, _, ok, err := readRecord(br, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

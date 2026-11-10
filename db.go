@@ -318,7 +318,11 @@ func Open[K cmp.Ordered, V any](path string, keyCodec Codec[K], valCodec Codec[V
 	}
 
 	state := newDBState[K, V]()
-	validLen, parsedLen, err := replayLog(f, func(rec walRecord) error {
+	// The record buffer is reused across records only when both codecs
+	// copy what they decode; anything else might keep a reference into
+	// it (see Codec.detached).
+	reuse := keyCodec.detached && valCodec.detached
+	validLen, parsedLen, err := replayLog(f, reuse, func(rec walRecord) error {
 		// Decrypt the value payload before decoding. For a plaintext log (or
 		// an opDelete, which is never sealed) openRecord passes the bytes
 		// through unchanged. A decrypt failure here is past the CRC, so it is
@@ -337,7 +341,7 @@ func Open[K cmp.Ordered, V any](path string, keyCodec Codec[K], valCodec Codec[V
 			if err != nil {
 				return serr.Wrap(err, "decoding", "value")
 			}
-			state.set(key, val, 0)
+			state.replaySet(key, val, 0)
 		case opSetTTL:
 			if len(valBytes) < ttlPrefixSize {
 				return serr.New("malformed ttl record")

@@ -248,7 +248,12 @@ type walRecord struct {
 // readRecord reads one framed record. ok is false at clean EOF and on a
 // torn or corrupt record — the caller treats both as end-of-valid-log.
 // err is reserved for real I/O failures.
-func readRecord(br *bufio.Reader) (rec walRecord, size int64, ok bool, err error) {
+//
+// scratch, when non-nil, is a buffer the record's body is read into
+// (grown as needed) instead of a fresh allocation; the returned record's
+// key and val then alias it and are valid only until the next call with
+// the same scratch.
+func readRecord(br *bufio.Reader, scratch *[]byte) (rec walRecord, size int64, ok bool, err error) {
 	var hdr [recHeaderSize]byte
 	if _, e := io.ReadFull(br, hdr[:]); e != nil {
 		if errors.Is(e, io.EOF) || errors.Is(e, io.ErrUnexpectedEOF) {
@@ -263,7 +268,15 @@ func readRecord(br *bufio.Reader) (rec walRecord, size int64, ok bool, err error
 		return rec, 0, false, nil // corrupt
 	}
 
-	body := make([]byte, klen+vlen+recCRCSize)
+	var body []byte
+	if scratch != nil {
+		if n := int(klen + vlen + recCRCSize); cap(*scratch) < n {
+			*scratch = make([]byte, n, max(n, 2*cap(*scratch)))
+		}
+		body = (*scratch)[:klen+vlen+recCRCSize]
+	} else {
+		body = make([]byte, klen+vlen+recCRCSize)
+	}
 	if _, e := io.ReadFull(br, body); e != nil {
 		if errors.Is(e, io.EOF) || errors.Is(e, io.ErrUnexpectedEOF) {
 			return rec, 0, false, nil // torn body
@@ -271,11 +284,12 @@ func readRecord(br *bufio.Reader) (rec walRecord, size int64, ok bool, err error
 		return rec, 0, false, serr.Wrap(e, "phase", "read record body")
 	}
 
+	// The CRC covers header and body; crc32.Update chains over the two
+	// without the heap-allocated hash.Hash32 a NewIEEE digest costs per
+	// record.
 	wantCRC := binary.LittleEndian.Uint32(body[klen+vlen:])
-	h := crc32.NewIEEE()
-	h.Write(hdr[:])
-	h.Write(body[:klen+vlen])
-	if h.Sum32() != wantCRC {
+	crc := crc32.Update(crc32.Update(0, crc32.IEEETable, hdr[:]), crc32.IEEETable, body[:klen+vlen])
+	if crc != wantCRC {
 		return rec, 0, false, nil // corrupt
 	}
 
@@ -297,11 +311,20 @@ func readRecord(br *bufio.Reader) (rec walRecord, size int64, ok bool, err error
 // "good data after the corruption"). A torn or corrupt record ends
 // replay without error. An apply failure (e.g. codec mismatch) is
 // returned as a hard error since the data itself is intact.
-func replayLog(r io.Reader, apply func(rec walRecord) error) (validLen, parsedLen int64, err error) {
+//
+// reuse lets a record applied on its own (not a batch member) be read
+// into one buffer shared by all of them; apply must then not retain the
+// record's bytes, which the next record overwrites. Batch members are
+// held until the batch is known intact, so each keeps its own bytes.
+func replayLog(r io.Reader, reuse bool, apply func(rec walRecord) error) (validLen, parsedLen int64, err error) {
 	br := bufio.NewReaderSize(r, 1<<20)
 	var off, parsed int64
+	var scratch *[]byte
+	if reuse {
+		scratch = new([]byte)
+	}
 	for {
-		rec, size, ok, err := readRecord(br)
+		rec, size, ok, err := readRecord(br, scratch)
 		if err != nil {
 			return off, parsed, err
 		}
@@ -331,7 +354,7 @@ func replayLog(r io.Reader, apply func(rec walRecord) error) (validLen, parsedLe
 		parsed = off + size
 		intact := true
 		for range n {
-			brec, bsize, bok, berr := readRecord(br)
+			brec, bsize, bok, berr := readRecord(br, nil)
 			if berr != nil {
 				return off, parsed, berr
 			}

@@ -14,19 +14,29 @@ import (
 type Codec[T any] struct {
 	Encode func(T) ([]byte, error)
 	Decode func([]byte) (T, error)
+
+	// detached marks the built-in codecs, whose Decode never keeps a
+	// reference to its input. Replay then reads every record into one
+	// reused buffer instead of allocating each its own (bytdb deep-look
+	// D-48). A Codec built outside this package has it false: its
+	// Decode may alias the bytes it is given, so each record keeps
+	// fresh ones, as it always has.
+	detached bool
 }
 
 // StringCodec encodes strings as their raw bytes.
 var StringCodec = Codec[string]{
-	Encode: func(s string) ([]byte, error) { return []byte(s), nil },
-	Decode: func(b []byte) (string, error) { return string(b), nil },
+	Encode:   func(s string) ([]byte, error) { return []byte(s), nil },
+	Decode:   func(b []byte) (string, error) { return string(b), nil },
+	detached: true,
 }
 
 // BytesCodec passes byte slices through, cloning on decode so callers
 // never alias the replay buffer.
 var BytesCodec = Codec[[]byte]{
-	Encode: func(b []byte) ([]byte, error) { return b, nil },
-	Decode: func(b []byte) ([]byte, error) { return bytes.Clone(b), nil },
+	Encode:   func(b []byte) ([]byte, error) { return b, nil },
+	Decode:   func(b []byte) ([]byte, error) { return bytes.Clone(b), nil },
+	detached: true,
 }
 
 // Int64Codec encodes int64s as 8 fixed bytes (little-endian).
@@ -40,6 +50,7 @@ var Int64Codec = Codec[int64]{
 		}
 		return int64(binary.LittleEndian.Uint64(b)), nil
 	},
+	detached: true,
 }
 
 // Uint64Codec encodes uint64s as 8 fixed bytes (little-endian).
@@ -53,6 +64,7 @@ var Uint64Codec = Codec[uint64]{
 		}
 		return binary.LittleEndian.Uint64(b), nil
 	},
+	detached: true,
 }
 
 // JSONCodec encodes any type via encoding/json. Handy for struct values.
@@ -66,5 +78,8 @@ func JSONCodec[T any]() Codec[T] {
 			}
 			return v, nil
 		},
+		// encoding/json copies what it decodes (strings, base64 bytes,
+		// RawMessage) out of its input.
+		detached: true,
 	}
 }
