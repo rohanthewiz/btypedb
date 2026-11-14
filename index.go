@@ -36,7 +36,11 @@ func (db *DB[K, V]) CreateIndex(name string, compare func(ak K, av V, bk K, bv V
 	for k, v := range db.state.data.All() {
 		ix.tree.Set(ientry[K, V]{k: k, v: v})
 	}
+	// The cached read snapshot has its own idx map and would go on
+	// answering read-only Begins without the new index.
+	db.dropReadSnap()
 	db.state.idx[name] = ix
+	db.indexChanged()
 	return nil
 }
 
@@ -53,9 +57,27 @@ func (db *DB[K, V]) DropIndex(name string) error {
 	if !exists {
 		return serr.New("no such index", "index", name)
 	}
+	db.dropReadSnap() // as in CreateIndex: readers after this must not see it
 	delete(db.state.idx, name)
+	db.indexChanged()
 	ix.tree.Release()
 	return nil
+}
+
+// indexChanged tells open concurrent-writes transactions that the set
+// of indexes moved under them. Each such transaction carries its own
+// copy of the idx map from Begin; committed by pointer swap, it would
+// put back an index dropped since, or drop one created since. An empty
+// ring entry conflicts with nothing but bumps commitVersion, so every
+// transaction begun before this point takes Commit's rebase path
+// instead: its writes are replayed onto the current head, which has
+// the right indexes and maintains them. Default mode needs nothing:
+// writable transactions hold writerMu for their whole life, so none
+// can be open here. The caller holds writerMu and mu.
+func (db *DB[K, V]) indexChanged() {
+	if db.occ {
+		db.pushCommit(commitEntry[K]{})
+	}
 }
 
 // Indexes returns the names of the registered indexes, sorted.

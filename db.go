@@ -27,6 +27,7 @@ import (
 	"iter"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rohanthewiz/serr"
@@ -213,6 +214,11 @@ type DB[K cmp.Ordered, V any] struct {
 
 	mu    sync.RWMutex
 	state *dbState[K, V]
+	// readSnap caches the snapshot that read-only transactions share
+	// while the head stays unchanged (see readsnap.go). Loaded without
+	// a lock by Begin's fast path; stored only under mu. Every change
+	// to state must call dropReadSnap first.
+	readSnap atomic.Pointer[sharedRead[K, V]]
 	// commitVersion counts publishing commits; recent retains the
 	// changed-key summaries of the last occRingCap of them so an OCC
 	// committer can validate its snapshot's staleness (see occ.go).
@@ -471,6 +477,7 @@ func (db *DB[K, V]) setInternal(key K, value V, deadline int64) error {
 		err = db.appendToLog(op, kb, vb)
 	}
 	if err == nil {
+		db.dropReadSnap()
 		db.state.set(key, value, deadline)
 		if db.occ {
 			// A direct write is a one-key commit: open OCC
@@ -525,6 +532,7 @@ func (db *DB[K, V]) Delete(key K) (existed bool, err error) {
 		err = db.appendToLog(opDelete, kb, nil)
 	}
 	if err == nil {
+		db.dropReadSnap()
 		db.state.delete(key)
 		if db.occ {
 			db.pushCommit(commitEntry[K]{keys: []K{key}})
@@ -721,6 +729,10 @@ func (db *DB[K, V]) Close() error {
 		return nil
 	}
 	db.closed = true
+	// Uncache the shared read snapshot so a read-only Begin after Close
+	// misses the lock-free fast path and reports ErrClosed. Transactions
+	// already open keep their reference and finish normally.
+	db.dropReadSnap()
 	db.mu.Unlock()
 
 	if db.stopSync != nil {

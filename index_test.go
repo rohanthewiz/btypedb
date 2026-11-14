@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -223,5 +224,63 @@ func TestDropAndUnknownIndex(t *testing.T) {
 	}
 	if got := indexKeys(db.AscendIndex("never-existed")); got != nil {
 		t.Fatalf("unknown index yields entries: %v", got)
+	}
+}
+
+// TestOCCIndexChangeSurvivesOpenTxCommit: in concurrent-writes mode a
+// transaction open across CreateIndex or DropIndex used to commit its
+// Begin-time copy of the index set by pointer swap, silently dropping
+// the new index (or restoring the dropped one, stale). The commit must
+// keep the head's index set and maintain the new index for its writes.
+func TestOCCIndexChangeSurvivesOpenTxCommit(t *testing.T) {
+	db := openStr(t, filepath.Join(t.TempDir(), "oi.db"), WithSyncPolicy(SyncNever), WithConcurrentWrites())
+	defer db.Close()
+	byVal := func(ak, av, bk, bv string) int { return strings.Compare(av, bv) }
+	if err := db.Set("a", "1"); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Set("b", "2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateIndex("ix", byVal); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if got := db.Indexes(); !slices.Equal(got, []string{"ix"}) {
+		t.Fatalf("Indexes after commit = %v; want [ix]", got)
+	}
+	var vals []string
+	for _, v := range db.AscendIndex("ix") {
+		vals = append(vals, v)
+	}
+	if !slices.Equal(vals, []string{"1", "2"}) {
+		t.Fatalf("index entries = %v; want [1 2] (the open tx's write maintained)", vals)
+	}
+
+	tx, err = db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Set("c", "3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DropIndex("ix"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if got := db.Indexes(); len(got) != 0 {
+		t.Fatalf("Indexes after commit = %v; want none (dropped index resurrected)", got)
+	}
+	if err := db.CreateIndex("ix", byVal); err != nil {
+		t.Fatalf("re-create after drop: %v", err)
 	}
 }

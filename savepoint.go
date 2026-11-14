@@ -16,8 +16,12 @@ var ErrSavepointInvalid = errors.New("btypedb: savepoint is no longer valid for 
 // indexes — plus the length of the write-ahead batch, so rolling back
 // is O(1) and the eventual commit logs exactly the surviving writes.
 type Savepoint[K cmp.Ordered, V any] struct {
-	state      *dbState[K, V] // COW snapshot of the tx state at the mark
-	pendingLen int            // tx.pending length at the mark
+	// state is a COW snapshot of the tx state at the mark, or nil in a
+	// read-only transaction, whose state never changes and is shared
+	// with other readers (readsnap.go): copying it would write the
+	// shared trees' bookkeeping, and there is nothing to roll back.
+	state      *dbState[K, V]
+	pendingLen int // tx.pending length at the mark
 	nops       uint64
 	opsLen     int // tx.ops length at the mark (occ mode; 0 otherwise)
 	wrangesLen int // tx.wranges length at the mark (occ mode; 0 otherwise)
@@ -34,9 +38,12 @@ func (tx *Tx[K, V]) Savepoint() (*Savepoint[K, V], error) {
 	if tx.done {
 		return nil, ErrTxClosed
 	}
-	tx.db.mu.Lock()
-	st := tx.state.copy()
-	tx.db.mu.Unlock()
+	var st *dbState[K, V]
+	if tx.shared == nil {
+		tx.db.mu.Lock()
+		st = tx.state.copy()
+		tx.db.mu.Unlock()
+	}
 	sp := &Savepoint[K, V]{
 		state:      st,
 		pendingLen: len(tx.pending),
@@ -57,6 +64,15 @@ func (tx *Tx[K, V]) RollbackTo(sp *Savepoint[K, V]) error {
 	i, err := tx.findSave(sp)
 	if err != nil {
 		return err
+	}
+	if sp.state == nil {
+		// Read-only: the state cannot have changed since the mark, and
+		// the later marks hold nothing to release.
+		for _, later := range tx.saves[i+1:] {
+			later.active = false
+		}
+		tx.saves = tx.saves[:i+1]
+		return nil
 	}
 	tx.db.mu.Lock()
 	for _, later := range tx.saves[i+1:] {
@@ -85,6 +101,14 @@ func (tx *Tx[K, V]) Release(sp *Savepoint[K, V]) error {
 	if err != nil {
 		return err
 	}
+	if sp.state == nil {
+		// Read-only marks hold no snapshot (see Savepoint.state).
+		for _, s := range tx.saves[i:] {
+			s.active = false
+		}
+		tx.saves = tx.saves[:i]
+		return nil
+	}
 	tx.db.mu.Lock()
 	for _, s := range tx.saves[i:] {
 		s.state.release()
@@ -112,10 +136,14 @@ func (tx *Tx[K, V]) findSave(sp *Savepoint[K, V]) (int, error) {
 }
 
 // releaseSaves returns every outstanding savepoint snapshot to the COW
-// refcounting scheme. The caller must hold db.mu.
+// refcounting scheme. The caller must hold db.mu, unless the
+// transaction is read-only: its marks hold no snapshot (nil state), so
+// there is nothing shared to touch.
 func (tx *Tx[K, V]) releaseSaves() {
 	for _, sp := range tx.saves {
-		sp.state.release()
+		if sp.state != nil {
+			sp.state.release()
+		}
 		sp.active = false
 	}
 	tx.saves = nil

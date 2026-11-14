@@ -21,6 +21,10 @@ var ErrTxNotWritable = errors.New("btypedb: transaction is read-only")
 //
 // A read-only transaction sees the database exactly as it was at Begin,
 // no matter what commits afterward, and reads without taking any locks.
+// Read-only transactions begun while nothing has changed share one
+// snapshot, so Begin and Rollback on that path are a reference-count
+// update with no lock and no copy (see readsnap.go); a burst of
+// one-shot Views scales with cores.
 // A writable transaction works on a private copy — its changes are
 // invisible to others until Commit atomically publishes them.
 //
@@ -36,12 +40,18 @@ var ErrTxNotWritable = errors.New("btypedb: transaction is read-only")
 // goroutines (the DB itself is).
 type Tx[K cmp.Ordered, V any] struct {
 	db       *DB[K, V]
-	state    *dbState[K, V] // private COW snapshot of all trees
+	state    *dbState[K, V] // COW snapshot of all trees: private if writable, shared if read-only
 	writable bool
 	pending  []byte // framed WAL records accumulated by this tx
 	nops     uint64
 	saves    []*Savepoint[K, V] // outstanding savepoints, oldest first
 	done     bool
+
+	// shared is set on read-only transactions: state then belongs to
+	// a snapshot other readers hold too, so the transaction returns a
+	// reference at Commit/Rollback instead of releasing the trees, and
+	// must never write to state (see readsnap.go).
+	shared *sharedRead[K, V]
 
 	// holdsWriter tracks writerMu ownership so Commit and Rollback
 	// release exactly what was taken: the whole-lifetime lock from
@@ -91,6 +101,11 @@ func (db *DB[K, V]) Begin(writable bool) (*Tx[K, V], error) {
 // conflict. In default mode exclusive changes nothing — every writable
 // transaction already holds the lock for its lifetime.
 func (db *DB[K, V]) begin(writable, exclusive bool) (*Tx[K, V], error) {
+	if !writable {
+		// Read-only transactions share one snapshot per head version
+		// instead of each copying the head under mu (readsnap.go).
+		return db.beginRead()
+	}
 	takeWriter := writable && (!db.occ || exclusive)
 	if takeWriter {
 		db.writerMu.Lock()
@@ -288,10 +303,11 @@ func (tx *Tx[K, V]) Commit() error {
 	db := tx.db
 
 	if !tx.writable {
-		db.mu.Lock()
+		// Read-only savepoints hold no snapshot, so clearing them
+		// needs no lock; the shared snapshot's reference goes back
+		// without one too, except for its last holder.
 		tx.releaseSaves()
-		tx.state.release()
-		db.mu.Unlock()
+		tx.releaseRead()
 		return nil
 	}
 
@@ -358,6 +374,7 @@ func (tx *Tx[K, V]) Commit() error {
 		db.writerMu.Unlock()
 		return err
 	}
+	db.dropReadSnap() // before the swap: see readsnap.go on ordering
 	old := db.state
 	db.state = tx.state
 	old.release()
@@ -386,6 +403,12 @@ func (tx *Tx[K, V]) Rollback() error {
 		return nil
 	}
 	tx.done = true
+	if tx.shared != nil {
+		// Read-only: see the matching branch in Commit.
+		tx.releaseSaves()
+		tx.releaseRead()
+		return nil
+	}
 	tx.db.mu.Lock()
 	tx.releaseSaves()
 	tx.state.release()

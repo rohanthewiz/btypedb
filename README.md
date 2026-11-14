@@ -50,6 +50,9 @@ Transactions run against O(1) copy-on-write snapshots of the B-tree:
 
 ```go
 // Read-only: a frozen, lock-free view — later commits are invisible to it.
+// Read-only transactions begun while nothing has changed share one
+// snapshot, so a View costs a reference-count update, not a copy, and
+// one-shot Views from many goroutines scale with cores.
 err = db.View(func(tx *btypedb.Tx[string, User]) error {
     u, ok := tx.Get("ada")
     for k, v := range tx.All() { /* consistent snapshot */ }
@@ -269,7 +272,9 @@ Two layers beyond ordinary unit tests:
 `tidwall/btype` is pre-v1 with an unstable API, and this package's
 lock-free snapshot reads rely on btype internals verified by source
 inspection (atomic COW refcounts; shared nodes are copied, never mutated
-in place) that aren't part of its documented contract. The version is
+in place; read paths — Get and the non-Mut iterators — write nothing, so
+many goroutines can read one shared snapshot) that aren't part of its
+documented contract. The version is
 deliberately pinned; `TestBtypePinned` fails on drift. To upgrade:
 re-inspect those properties, run the full suite (race hammer + crash +
 power-loss tests), then bump the pin in `go.mod` and `pin_test.go`.
